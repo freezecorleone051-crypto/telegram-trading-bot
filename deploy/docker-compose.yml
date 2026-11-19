@@ -1,0 +1,15 @@
+# Utilisation :
+#   1) remplis le fichier .env à côté du docker-compose
+#   2) docker compose up -d --build
+#   3) les logs : docker compose logs -f bot
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: trading-telegram-bot
+    env_file: ../.env
+    restart: unless-stopped
+    volumes:
+      - ../data_store:/app/data_store
+      - ../logs:/app/logs

@@ -1,0 +1,22 @@
+# Service systemd — fait tourner le bot en continu sur un serveur Linux.
+# Installation :
+#   1) copie le projet dans /opt/trading-bot (par exemple)
+#   2) sudo cp deploy/bot.service /etc/systemd/system/
+#   3) sudo systemctl daemon-reload
+#   4) sudo systemctl enable --now trading-bot
+#   5) journalctl -u trading-bot -f   (voir les logs)
+[Unit]
+Description=Bot Telegram de signaux de trading
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ton_utilisateur
+WorkingDirectory=/opt/trading-bot
+ExecStart=/usr/bin/python3 /opt/trading-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
