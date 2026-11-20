@@ -201,20 +201,31 @@ Pour ajouter des actifs : `data/markets.py` (`CRYPTO_ASSETS`, `FOREX_ASSETS`,
 
 ## 7. Faire tourner le bot en continu
 
-Trois options, de la plus simple à la plus robuste :
+Quatre options, de la plus simple à la plus robuste :
 
-**a) Script local** (Linux/macOS) :
+**a) Scans planifiés sur GitHub Actions** (pas de bot interactif en continu) :
+
+Le workflow `.github/workflows/trading-bot.yml` lance un cycle de scan toutes
+les 30 minutes et sauvegarde l'historique dans le dépôt. Ajoute les secrets
+`BOT_TOKEN` et `ADMIN_ID` dans **Settings > Secrets and variables > Actions**,
+puis lance un premier test depuis **Actions > Scan bot de trading > Run workflow**.
+Les scans programmés ne répondent pas aux commandes Telegram entre deux cycles.
+Pour un dépôt privé, tu peux remplacer la cron par `13 */2 * * *` pour réduire
+la consommation de minutes GitHub Actions. Les horaires cron sont en UTC :
+`7,37 * * * *` correspond à 09:07 et 09:37 en UTC+2 (GitHub peut avoir du retard).
+
+**b) Script local** (Linux/macOS) :
 ```bash
 deploy/run.sh          # crée le venv, installe, lance
 ```
 
-**b) Docker** :
+**c) Docker** :
 ```bash
 cd deploy && docker compose up -d --build
 docker compose logs -f bot
 ```
 
-**c) systemd** (serveur Linux) :
+**d) systemd** (serveur Linux) :
 ```bash
 sudo cp deploy/bot.service /etc/systemd/system/   # adapter User et chemin
 sudo systemctl enable --now trading-bot
