@@ -1,0 +1,18 @@
+{
+ "signals": [
+  {
+   "id": 1,
+   "time": "2026-11-20T09:54:40.674883+00:00",
+   "market": "crypto",
+   "asset": "SOL/USDT",
+   "tf": "15m",
+   "direction": "VENTE",
+   "confidence": 75,
+   "entry": 72.1,
+   "tp": 71.574,
+   "sl": 72.451,
+   "source": "Yahoo Finance (SOL-USD, secours)",
+   "status": "open"
+  }
+ ]
+}
