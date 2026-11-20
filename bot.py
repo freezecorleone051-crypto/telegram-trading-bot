@@ -457,6 +457,23 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Démarrage
 # ==================================================================
 async def post_init(application: Application):
+    if settings.AUTO_SCAN:
+        if application.job_queue is None:
+            raise RuntimeError(
+                "AUTO_SCAN est activé, mais la file de tâches Telegram "
+                "n'est pas disponible."
+            )
+        if not application.job_queue.get_jobs_by_name("scan"):
+            application.job_queue.run_repeating(
+                scan_job,
+                interval=settings.SCAN_INTERVAL_MIN * 60,
+                first=10,
+                name="scan",
+                chat_id=settings.ADMIN_ID,
+            )
+            log.info("Scan automatique démarré toutes les %s minutes.",
+                     settings.SCAN_INTERVAL_MIN)
+
     try:
         await application.bot.send_message(
             chat_id=settings.ADMIN_ID,

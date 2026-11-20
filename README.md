@@ -187,6 +187,7 @@ pas à ton broker :
 | `SIGNAL_MIN_MARGIN` | 2 | écart minimum entre les deux côtés |
 | `SCAN_INTERVAL_MIN` | 5 | intervalle du scan automatique |
 | `COOLDOWN_MIN` | 15 | délai avant de renvoyer le même signal |
+| `AUTO_SCAN` | 0 | démarre le scan automatiquement au lancement (`1` pour l'activer) |
 | `WATCHLIST` | BTC 5m, EUR/USD 5m, BTC OTC 5m | watchlist initiale |
 | `BALANCE` / `RISK_PCT` | 0 / 1.0 | balance fictive et % de risque -> taille de position |
 | `TP_ATR` / `SL_ATR` | 1.5 / 1.0 | calibration TP/SL sur l'ATR |
@@ -201,18 +202,22 @@ Pour ajouter des actifs : `data/markets.py` (`CRYPTO_ASSETS`, `FOREX_ASSETS`,
 
 ## 7. Faire tourner le bot en continu
 
-Quatre options, de la plus simple à la plus robuste :
+Options d'exécution :
 
-**a) Scans planifiés sur GitHub Actions** (pas de bot interactif en continu) :
+**a) Sessions GitHub Actions** (mode expérimental, disponibilité non garantie) :
 
-Le workflow `.github/workflows/trading-bot.yml` lance un cycle de scan toutes
-les 30 minutes et sauvegarde l'historique dans le dépôt. Ajoute les secrets
-`BOT_TOKEN` et `ADMIN_ID` dans **Settings > Secrets and variables > Actions**,
-puis lance un premier test depuis **Actions > Scan bot de trading > Run workflow**.
-Les scans programmés ne répondent pas aux commandes Telegram entre deux cycles.
-Pour un dépôt privé, tu peux remplacer la cron par `13 */2 * * *` pour réduire
-la consommation de minutes GitHub Actions. Les horaires cron sont en UTC :
-`7,37 * * * *` correspond à 09:07 et 09:37 en UTC+2 (GitHub peut avoir du retard).
+Le workflow `.github/workflows/bot-24h.yml` démarre le bot en sessions
+programmées et sauvegarde l'historique. Ajoute les secrets `BOT_TOKEN` et
+`ADMIN_ID` dans **Settings > Secrets and variables > Actions**, puis teste-le
+depuis **Actions > Bot par sessions > Run workflow**.
+
+Ce n'est pas un hébergement 24h/24 garanti : chaque session s'arrête après
+environ 5 h 35, et le bot ne répond pas pendant les interruptions. GitHub peut
+aussi retarder un lancement. La cron `3 */6 * * *` est en UTC (02:03, 08:03,
+14:03 et 20:03 en UTC+2). Utilise ce mode seulement pour un dépôt public et
+vérifie les limites et règles d'utilisation GitHub Actions. Pour une présence
+interactive fiable en continu, utilise plutôt un VPS ou un serveur toujours actif.
+Voir le [guide GitHub Actions](./deploy/GUIDE-GITHUB-ACTIONS.md) pour la mise en place.
 
 **b) Script local** (Linux/macOS) :
 ```bash

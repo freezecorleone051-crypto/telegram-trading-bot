@@ -43,6 +43,9 @@ SIGNAL_MIN_MARGIN = int(os.getenv("SIGNAL_MIN_MARGIN", "2"))
 # ------------------------------------------------------------------
 SCAN_INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MIN", "5"))
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "15"))
+AUTO_SCAN = os.getenv("AUTO_SCAN", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 # Watchlist par défaut (modifiable en direct avec /watch add / /watch remove)
 WATCHLIST = [
