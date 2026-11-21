@@ -1,39 +1,36 @@
-# Bot Telegram "24 h/24" par sessions de ~5 h 45 enchaînées sur GitHub Actions.
+# Bot Telegram « 24 h/24 » par sessions de ~5 h 45 enchaînées sur GitHub Actions.
 #
-# MISE EN PLACE (une seule fois) — dans ton dépôt GitHub :
+# MISE EN PLACE (une seule fois) — dans le dépôt GitHub :
 #   Settings -> Secrets and variables -> Actions
-#     * « Secrets »   : BOT_TOKEN (token @BotFather) et ADMIN_ID (ton ID Telegram)
-#     * « Variables » : WATCHLIST (facultatif, remplace la liste ci-dessous sans modifier
-#                       ce fichier), ex. crypto:BTC/USDT:15m,stocks:NVDA:1h
-#   Settings -> Actions -> General -> Workflow permissions : « Read and write permissions »
-#   Puis : Actions -> « Bot par sessions » -> Run workflow (la 1re session démarre tout de suite).
-#   Écris /start à ton bot : il répond tant qu'une session tourne.
+#     * Secrets   : BOT_TOKEN (token @BotFather) et ADMIN_ID (ID Telegram)
+#     * Variables : WATCHLIST (facultatif), ex. crypto:BTC/USDT:15m,stocks:NVDA:1h
+#   Settings -> Actions -> General -> Workflow permissions : Read and write permissions
+#   Puis : Actions -> « Bot par sessions » -> Run workflow.
 #
-# À LIRE AVANT D'UTILISER (voir aussi README, section 10)
-#   1. COÛT : ce workflow occupe un serveur ~24 h/24, soit ~40 000 minutes par mois.
-#      Les serveurs standard sont gratuits pour un dépôt PUBLIC ; un dépôt PRIVÉ n'a qu'un
-#      quota gratuit d'environ 2 000 minutes par mois (il serait épuisé en ~1 jour).
-#   2. RÈGLES GITHUB : les conditions d'utilisation de GitHub interdisent d'utiliser Actions
-#      pour une activité sans rapport avec la production, les tests ou le déploiement du
-#      projet du dépôt. Faire tourner un bot en continu peut être jugé hors cadre : GitHub
-#      peut limiter ou suspendre le service. Pour un usage durable, un petit serveur
-#      (VPS) est plus sûr : voir deploy/Dockerfile et deploy/docker-compose.yml.
-#   3. TROUS : entre deux sessions (quelques minutes, plus si GitHub retarde le planning)
-#      le bot ne répond pas et ne scanne pas ; les commandes envoyées à ce moment sont
-#      ignorées. Un dépôt PUBLIC rend aussi visible l'historique des signaux (branche
-#      bot-state) : sans secret, mais visible.
+# À LIRE AVANT D'UTILISER
+#   1. COÛT : environ 24 h/24, soit ~40 000 minutes par mois. Les minutes standard
+#      sont gratuites sur un dépôt PUBLIC. Un dépôt PRIVÉ (~2 000 min/mois) est
+#      épuisé en un jour environ.
+#   2. Ne lance pas bot.py sur ton PC en même temps : Telegram renvoie l'erreur 409.
+#   3. Un seul workflow de scan. Un second workflow enverrait les alertes en double.
+#   4. Entre deux sessions (quelques minutes, davantage si GitHub retarde le cron)
+#      le bot ne répond pas. L'historique (signaux, watchlist) vit sur la branche
+#      bot-state : visible si le dépôt est public, sans secret.
+#   5. Les conditions d'utilisation de GitHub visent le développement du dépôt.
+#      Un VPS reste plus adapté à un bot durable : voir deploy/.
 name: Bot par sessions
 
 on:
   schedule:
+    # 00:03, 06:03, 12:03, 18:03 UTC (02:03, 08:03, 14:03, 20:03 en UTC+2)
     - cron: "3 */6 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write            # pour sauvegarder l'historique dans la branche bot-state
+  contents: write
 
-# Une seule session à la fois : deux bots sur le même token se bloquent (erreur Telegram 409).
-# La session suivante attend la fin de la précédente (et de sa sauvegarde).
+# Une seule session à la fois : deux bots sur le même token se bloquent (erreur 409).
+# La session suivante attend la fin de la précédente, y compris sa sauvegarde.
 concurrency:
   group: bot-24-7
   cancel-in-progress: false
@@ -41,10 +38,12 @@ concurrency:
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355     # limite GitHub = 360
+    timeout-minutes: 355
     steps:
       - name: Récupérer le code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: true
 
       - name: Installer Python
         uses: actions/setup-python@v7
@@ -64,12 +63,15 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
-          SCAN_AUTOSTART: "true"          # (v1 : AUTO_SCAN, encore accepté)
-          # Variable GitHub WATCHLIST si elle existe, sinon cette liste :
+          SCAN_AUTOSTART: "true"
+          # Variable GitHub WATCHLIST si elle existe, sinon cette liste.
+          # Format : marché:actif:timeframe, séparés par des virgules.
           WATCHLIST: ${{ vars.WATCHLIST || 'crypto:BTC/USDT:5m,crypto:ETH/USDT:5m,crypto:SOL/USDT:15m,forex:EUR/USD:5m,forex:GBP/USD:15m,forex:XAU/USD:15m,otc:BTC/USD OTC:15m,otc:EUR/USD OTC:15m' }}
           MPLBACKEND: "Agg"
           PYTHONUNBUFFERED: "1"
         run: |
+          # 5 h 45 : on s'arrête avant la limite de 6 h pour laisser le temps
+          # de sauvegarder l'historique. Le code 124 est l'arrêt normal.
           set +e
           timeout -k 30s 345m python -u bot.py
           status=$?
@@ -78,7 +80,6 @@ jobs:
             echo "Session terminée normalement après la durée prévue."
             exit 0
           fi
-          # Le bot ne doit JAMAIS s'arrêter seul : on le signale (rouge) au lieu d'un faux succès.
           echo "::error::Le bot s'est arrêté avant la fin de la session (code $status). Voir les logs ci-dessus."
           if [ "$status" -eq 0 ]; then exit 1; fi
           exit "$status"
