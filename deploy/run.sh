@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Lance le bot en environnement virtuel propre (Linux / macOS).
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."     # racine du projet (v1 : on restait dans deploy/ et .env était introuvable)
 
 if [ ! -f .env ]; then
     echo "ERREUR : fichier .env manquant. Copie .env.example puis remplis-le :"

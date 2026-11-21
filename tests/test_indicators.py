@@ -77,7 +77,7 @@ def test_stochastic_range():
 
 def test_smart_round():
     assert indicators.smart_round(63666.12345) == 63666.12   # >= 100 : 2 décimales
-    assert indicators.smart_round(1.0969123) == 1.0969       # >= 1 : 4 décimales
+    assert indicators.smart_round(1.0969123) == 1.09691      # 1-10 : 5 décimales (standard forex)
     assert indicators.smart_round(159.55123) == 159.55       # >= 100 : 2 décimales
     assert indicators.smart_round(0.551234) == 0.55123       # >= 0.1 : 5 décimales
     assert indicators.smart_round(0.001234) == 0.001234      # < 0.1 : 6 décimales
@@ -97,3 +97,42 @@ if __name__ == "__main__":
         t()
         print(f"[OK] {t.__name__}")
     print(f"\n{len(tests)} tests indicateurs : tous passent")
+
+
+def test_rsi_marche_plat_vaut_50():
+    # v1 : un marché parfaitement plat donnait RSI = 0 (« survente ») -> faux signal d'achat
+    flat = pd.Series([100.0] * 60)
+    assert float(indicators.rsi(flat).iloc[-1]) == 50.0
+
+
+def test_rsi_hausse_pure_vaut_100_et_baisse_pure_vaut_0():
+    up = pd.Series([100.0 + i for i in range(60)])
+    down = pd.Series([200.0 - i for i in range(60)])
+    assert float(indicators.rsi(up).iloc[-1]) == 100.0
+    assert float(indicators.rsi(down).iloc[-1]) == 0.0
+
+
+def test_stochastique_marche_plat_vaut_50():
+    n = 40
+    df = pd.DataFrame({"open": [10.0] * n, "high": [10.0] * n, "low": [10.0] * n,
+                       "close": [10.0] * n, "volume": [1.0] * n})
+    k, d = indicators.stochastic(df)
+    assert float(k.iloc[-1]) == 50.0
+
+
+def test_adx_tendance_forte_vs_range():
+    from synthetic import make_ohlc
+    trend = make_ohlc(300, seed=1, drift=0.002, vol=0.001)
+    rng = make_ohlc(300, seed=2, drift=0.0, vol=0.002, reversion=0.15)
+    adx_t = float(indicators.adx(trend)[0].iloc[-1])
+    adx_r = float(indicators.adx(rng)[0].iloc[-1])
+    assert adx_t > 30 > adx_r or adx_t > adx_r + 10, (adx_t, adx_r)
+    pdi, mdi = indicators.adx(trend)[1].iloc[-1], indicators.adx(trend)[2].iloc[-1]
+    assert pdi > mdi          # tendance haussière : DI+ > DI-
+
+
+def test_volume_ratio_nan_sans_volume():
+    n = 40
+    df = pd.DataFrame({"open": [1.0] * n, "high": [1.1] * n, "low": [0.9] * n,
+                       "close": [1.0] * n, "volume": [0.0] * n})
+    assert pd.isna(indicators.volume_ratio(df).iloc[-1])

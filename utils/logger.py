@@ -28,7 +28,6 @@ def setup_logging() -> logging.Logger:
     file_handler.setFormatter(fmt)
     log.addHandler(file_handler)
 
-    # Réduire le bruit des librairies
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)

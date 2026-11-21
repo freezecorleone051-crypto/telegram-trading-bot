@@ -1,3 +1,27 @@
+# Bot Telegram "24 h/24" par sessions de ~5 h 45 enchaînées sur GitHub Actions.
+#
+# MISE EN PLACE (une seule fois) — dans ton dépôt GitHub :
+#   Settings -> Secrets and variables -> Actions
+#     * « Secrets »   : BOT_TOKEN (token @BotFather) et ADMIN_ID (ton ID Telegram)
+#     * « Variables » : WATCHLIST (facultatif, remplace la liste ci-dessous sans modifier
+#                       ce fichier), ex. crypto:BTC/USDT:15m,stocks:NVDA:1h
+#   Settings -> Actions -> General -> Workflow permissions : « Read and write permissions »
+#   Puis : Actions -> « Bot par sessions » -> Run workflow (la 1re session démarre tout de suite).
+#   Écris /start à ton bot : il répond tant qu'une session tourne.
+#
+# À LIRE AVANT D'UTILISER (voir aussi README, section 10)
+#   1. COÛT : ce workflow occupe un serveur ~24 h/24, soit ~40 000 minutes par mois.
+#      Les serveurs standard sont gratuits pour un dépôt PUBLIC ; un dépôt PRIVÉ n'a qu'un
+#      quota gratuit d'environ 2 000 minutes par mois (il serait épuisé en ~1 jour).
+#   2. RÈGLES GITHUB : les conditions d'utilisation de GitHub interdisent d'utiliser Actions
+#      pour une activité sans rapport avec la production, les tests ou le déploiement du
+#      projet du dépôt. Faire tourner un bot en continu peut être jugé hors cadre : GitHub
+#      peut limiter ou suspendre le service. Pour un usage durable, un petit serveur
+#      (VPS) est plus sûr : voir deploy/Dockerfile et deploy/docker-compose.yml.
+#   3. TROUS : entre deux sessions (quelques minutes, plus si GitHub retarde le planning)
+#      le bot ne répond pas et ne scanne pas ; les commandes envoyées à ce moment sont
+#      ignorées. Un dépôt PUBLIC rend aussi visible l'historique des signaux (branche
+#      bot-state) : sans secret, mais visible.
 name: Bot par sessions
 
 on:
@@ -6,8 +30,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write            # pour sauvegarder l'historique dans la branche bot-state
 
+# Une seule session à la fois : deux bots sur le même token se bloquent (erreur Telegram 409).
+# La session suivante attend la fin de la précédente (et de sa sauvegarde).
 concurrency:
   group: bot-24-7
   cancel-in-progress: false
@@ -15,53 +41,49 @@ concurrency:
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 355     # limite GitHub = 360
     steps:
-      - name: Recuperer le code
-        uses: actions/checkout@v4
+      - name: Récupérer le code
+        uses: actions/checkout@v7
 
       - name: Installer Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
 
-      - name: Installer les dependances
+      - name: Installer les dépendances
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Restaurer l'historique des signaux
+        run: bash deploy/github_state.sh restore
 
       - name: Lancer le bot pour une session limitée
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
-          AUTO_SCAN: "1"
-          WATCHLIST: "crypto:BTC/USDT:5m,crypto:ETH/USDT:5m,crypto:SOL/USDT:15m,forex:EUR/USD:5m,forex:GBP/USD:15m,forex:XAU/USD:15m,otc:BTC/USD OTC:15m,otc:EUR/USD OTC:15m"
+          SCAN_AUTOSTART: "true"          # (v1 : AUTO_SCAN, encore accepté)
+          # Variable GitHub WATCHLIST si elle existe, sinon cette liste :
+          WATCHLIST: ${{ vars.WATCHLIST || 'crypto:BTC/USDT:5m,crypto:ETH/USDT:5m,crypto:SOL/USDT:15m,forex:EUR/USD:5m,forex:GBP/USD:15m,forex:XAU/USD:15m,otc:BTC/USD OTC:15m,otc:EUR/USD OTC:15m' }}
           MPLBACKEND: "Agg"
           PYTHONUNBUFFERED: "1"
         run: |
           set +e
-          timeout -k 30s 335m python -u bot.py
+          timeout -k 30s 345m python -u bot.py
           status=$?
           set -e
           if [ "$status" -eq 124 ]; then
             echo "Session terminée normalement après la durée prévue."
             exit 0
           fi
+          # Le bot ne doit JAMAIS s'arrêter seul : on le signale (rouge) au lieu d'un faux succès.
+          echo "::error::Le bot s'est arrêté avant la fin de la session (code $status). Voir les logs ci-dessus."
+          if [ "$status" -eq 0 ]; then exit 1; fi
           exit "$status"
 
-      - name: Sauvegarder l'historique
-        run: |
-          git config user.name "trading-bot-actions"
-          git config user.email "actions@github.com"
-          if [ -d data_store ] && [ -n "$(ls -A data_store 2>/dev/null)" ]; then
-            git add -f data_store
-            if git diff --cached --quiet; then
-              echo "Historique inchangé, rien à sauvegarder."
-            else
-              git commit -m "Historique du bot (fin de session) [skip ci]"
-              git push
-            fi
-          else
-            echo "Aucune donnée à sauvegarder."
-          fi
+      # always() : l'historique est sauvegardé même si le bot a planté.
+      - name: Sauvegarder l'historique des signaux
+        if: always()
+        run: bash deploy/github_state.sh save

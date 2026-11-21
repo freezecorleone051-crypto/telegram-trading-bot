@@ -1,14 +1,16 @@
 """
-Génération de l'image d'analyse envoyée par le bot (la "photo" demandée).
+Génération de l'image d'analyse envoyée par le bot.
 
 L'image contient, sur le même graphique :
-- les bougies japonaises (80 dernières bougies)
-- les moyennes mobiles EMA 9 (orange) et EMA 21 (bleu)
+- les bougies japonaises FERMÉES (80 dernières par défaut)
+- les moyennes mobiles EMA 9 (orange), EMA 21 (bleu) et EMA 50 (violet)
 - les bandes de Bollinger (zone grisée)
-- les lignes Entrée (gris), Take Profit (vert) et Stop Loss (rouge)
-- un marqueur du signal sur la dernière bougie
-- en dessous, les panneaux RSI(14) et MACD(12,26,9) : exactement les
-  indicateurs utilisés pour décider -> on voit COMMENT le bot a raisonné.
+- les lignes Entrée / Take Profit / Stop Loss — UNIQUEMENT si un signal
+  ACHAT/VENTE est confirmé (sur ATTENDRE on ne trace aucun niveau : l'image
+  de la v1 montrait un TP/SL alors que le bot disait de ne pas entrer)
+- un marqueur sur la dernière bougie fermée
+- en dessous, les panneaux RSI(14), MACD(12,26,9) et ADX(14) : exactement les
+  indicateurs utilisés pour décider, y compris le régime tendance / range.
 """
 import io
 
@@ -16,7 +18,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
-from matplotlib.patches import Rectangle
 
 from config import settings
 from core import indicators
@@ -24,118 +25,151 @@ from core import indicators
 UP = "#26a69a"      # bougie haussière
 DOWN = "#ef5350"    # bougie baissière
 GRID = "#2b2b2b"
+DARK = "#12141a"
+FG = "#e8e8e8"
+SUB = "#9aa0a6"
 
 plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 
-DARK = "#12141a"
-FG = "#e8e8e8"
+
+def _label_box():
+    return dict(boxstyle="round,pad=0.2", facecolor=DARK, edgecolor="none", alpha=0.85)
+
+
+def _fmt_price(v: float, decimals: int | None) -> str:
+    return f"{indicators.smart_round(v, decimals):g}" if decimals is None else f"{v:.{decimals}f}"
 
 
 def make_chart(df: pd.DataFrame, signal: dict, asset: str, timeframe: str,
-               source_label: str) -> bytes:
+               source_label: str, label: str = "", decimals: int | None = None) -> bytes:
     n = min(settings.NB_CANDLES_CHART, len(df))
     d = df.tail(n).reset_index(drop=True)
     ind = signal["indicators"]
+    direction = signal["direction"]
 
-    fig = plt.figure(figsize=(12.5, 9), facecolor=DARK, constrained_layout=True)
-    gs = fig.add_gridspec(3, 1, height_ratios=[3.2, 1.0, 1.0])
+    fig = plt.figure(figsize=(12.5, 10.5), facecolor=DARK, constrained_layout=True)
+    gs = fig.add_gridspec(4, 1, height_ratios=[3.2, 1.0, 1.0, 0.9])
     ax1 = fig.add_subplot(gs[0])
     ax2 = fig.add_subplot(gs[1], sharex=ax1)
     ax3 = fig.add_subplot(gs[2], sharex=ax1)
-
-    for ax in (ax1, ax2, ax3):
+    ax4 = fig.add_subplot(gs[3], sharex=ax1)
+    for ax in (ax1, ax2, ax3, ax4):
         ax.set_facecolor(DARK)
         ax.tick_params(colors=FG, labelsize=9)
         for spine in ax.spines.values():
             spine.set_color("#3a3a3a")
         ax.grid(True, color=GRID, linewidth=0.5, alpha=0.6)
-    # les heures seulement sur le panneau du bas
-    ax1.tick_params(labelbottom=False)
-    ax2.tick_params(labelbottom=False)
+    for ax in (ax1, ax2, ax3):
+        ax.tick_params(labelbottom=False)
 
     # ------------------------------------------------ bougies
-    for i, row in d.iterrows():
-        color = UP if row["close"] >= row["open"] else DOWN
-        ax1.plot([i, i], [row["low"], row["high"]], color=color, linewidth=1.1, zorder=2)
-        body_low = min(row["open"], row["close"])
-        body_h = max(abs(row["close"] - row["open"]), 1e-12)
-        ax1.add_patch(Rectangle((i - 0.32, body_low), 0.64, body_h,
-                                facecolor=color, edgecolor=color, zorder=3))
+    x = list(range(len(d)))
+    colors = [UP if c >= o else DOWN for o, c in zip(d["open"], d["close"])]
+    ax1.vlines(x, d["low"], d["high"], colors=colors, linewidth=1.1, zorder=2)
+    body_low = d[["open", "close"]].min(axis=1)
+    body_h = (d["close"] - d["open"]).abs().clip(lower=1e-12)
+    ax1.bar(x, body_h, bottom=body_low, width=0.64, color=colors, edgecolor=colors,
+            zorder=3)
 
-    x = range(len(d))
-    # Indicateurs calculés sur la SÉRIE COMPLÈTE (250 bougies) puis découpés
-    # sur la fenêtre : évite le "warm-up" qui déformait le début des courbes.
+    # Indicateurs calculés sur la SÉRIE COMPLÈTE puis découpés sur la fenêtre :
+    # évite le « warm-up » qui déformait le début des courbes.
     s = indicators.compute_series(df)
-    e9 = s["ema9"].tail(n).reset_index(drop=True)
-    e21 = s["ema21"].tail(n).reset_index(drop=True)
-    rsi_s = s["rsi"].tail(n).reset_index(drop=True)
-    macd_line = s["macd_line"].tail(n).reset_index(drop=True)
-    macd_sig = s["macd_signal"].tail(n).reset_index(drop=True)
-    hist = s["macd_hist"].tail(n).reset_index(drop=True)
-    bb_up = s["bb_upper"].tail(n).reset_index(drop=True)
-    bb_low = s["bb_lower"].tail(n).reset_index(drop=True)
 
-    ax1.plot(x, e9, color="#f4a261", linewidth=1.4, label="EMA 9", zorder=4)
-    ax1.plot(x, e21, color="#4d96ff", linewidth=1.4, label="EMA 21", zorder=4)
-    ax1.plot(x, bb_up, color="#888888", linewidth=0.8, linestyle=":", zorder=1)
-    ax1.plot(x, bb_low, color="#888888", linewidth=0.8, linestyle=":", zorder=1)
-    ax1.fill_between(x, bb_low, bb_up, color="#4d96ff", alpha=0.05, zorder=0)
+    def tail(name):
+        return s[name].tail(n).reset_index(drop=True)
 
-    # ------------------------------------------------ lignes entrée / TP / SL
-    ax1.axhline(signal["entry"], color="#cccccc", linestyle="--", linewidth=1.1, zorder=1)
-    ax1.axhline(signal["tp"], color="#4caf50", linestyle="--", linewidth=1.3, zorder=1)
-    ax1.axhline(signal["sl"], color="#e53935", linestyle="--", linewidth=1.3, zorder=1)
+    ax1.plot(x, tail("ema9"), color="#f4a261", linewidth=1.4, label="EMA 9", zorder=4)
+    ax1.plot(x, tail("ema21"), color="#4d96ff", linewidth=1.4, label="EMA 21", zorder=4)
+    ax1.plot(x, tail("ema50"), color="#b388ff", linewidth=1.2, label="EMA 50", zorder=4)
+    ax1.plot(x, tail("bb_upper"), color="#888888", linewidth=0.8, linestyle=":", zorder=1)
+    ax1.plot(x, tail("bb_lower"), color="#888888", linewidth=0.8, linestyle=":", zorder=1)
+    ax1.fill_between(x, tail("bb_lower"), tail("bb_upper"), color="#4d96ff", alpha=0.05, zorder=0)
+
+    # ------------------------------------------------ niveaux (seulement si signal)
     x_right = n + 1.5
-    ax1.set_xlim(-1, n + 6)
-    ax1.text(x_right, signal["entry"], f"Entrée {indicators.smart_round(signal['entry'])}",
-             color="#cccccc", fontsize=9, va="center", ha="left")
-    ax1.text(x_right, signal["tp"], f"TP {indicators.smart_round(signal['tp'])}",
-             color="#4caf50", fontsize=9, va="center", ha="left", fontweight="bold")
-    ax1.text(x_right, signal["sl"], f"SL {indicators.smart_round(signal['sl'])}",
-             color="#e53935", fontsize=9, va="center", ha="left", fontweight="bold")
+    ax1.set_xlim(-1, n + 8)
+    last_close = float(d["close"].iloc[-1])
+    if direction != "ATTENDRE":
+        for key, color, name, lw, bold in (("entry", "#cccccc", "Entrée", 1.1, "normal"),
+                                           ("tp", "#4caf50", "TP", 1.3, "bold"),
+                                           ("sl", "#e53935", "SL", 1.3, "bold")):
+            ax1.axhline(signal[key], color=color, linestyle="--", linewidth=lw, zorder=1)
+            ax1.text(x_right, signal[key], f"{name} {_fmt_price(signal[key], decimals)}",
+                     color=color, fontsize=9, va="center", ha="left",
+                     fontweight=bold, bbox=_label_box(), zorder=7)
+    else:
+        ax1.axhline(last_close, color="#777777", linestyle=":", linewidth=1.0, zorder=1)
+        ax1.text(x_right, last_close, f"Dernier {_fmt_price(last_close, decimals)}",
+                 color="#aaaaaa", fontsize=9, va="center", ha="left", bbox=_label_box())
 
     # ------------------------------------------------ marqueur du signal
-    arrow = "^" if signal["direction"] == "ACHAT" else ("v" if signal["direction"] == "VENTE" else "o")
-    mcolor = {"ACHAT": "#4caf50", "VENTE": "#e53935", "ATTENDRE": "#f4c20d"}[signal["direction"]]
-    ax1.scatter([n - 1], [d["close"].iloc[-1]], marker=arrow, s=200, color=mcolor, zorder=6)
-
+    marker = {"ACHAT": "^", "VENTE": "v", "ATTENDRE": "o"}[direction]
+    mcolor = {"ACHAT": "#4caf50", "VENTE": "#e53935", "ATTENDRE": "#f4c20d"}[direction]
+    ax1.scatter([n - 1], [last_close], marker=marker, s=200, color=mcolor, zorder=6)
     ax1.legend(loc="upper left", fontsize=9, facecolor="#1a1c24", edgecolor="#3a3a3a",
-               labelcolor=FG, framealpha=0.9)
+               labelcolor=FG, framealpha=0.9, ncols=3)
 
-    sub = (f"Signal : {signal['direction']}  |  Confiance : {signal['confidence']}%  |  "
-           f"Points ACHAT {ind['buy_points']} vs VENTE {ind['sell_points']}  |  "
-           f"Source des cours : {source_label}")
-    if signal["direction"] == "ATTENDRE":
-        sub += "  |  Pas de position conseillée, on observe"
-    ax1.set_title(f"{asset}  —  {timeframe}    (EMA 9/21 + Bollinger + RSI + MACD + Stochastique + ATR)",
-                  color=FG, fontsize=12, fontweight="bold", loc="left", pad=24)
-    ax1.text(0, 1.012, sub, transform=ax1.transAxes, color="#9aa0a6", fontsize=9)
+    # ------------------------------------------------ titre
+    name = f"{asset}" + (f" · {label}" if label and label != asset else "")
+    regime = signal.get("regime", "")
+    adx_v = ind.get("adx")
+    regime_txt = (f"Régime : {regime.upper()} (ADX {adx_v:.0f})"
+                  if regime and adx_v == adx_v else "")
+    sub1 = (f"Signal : {direction}  |  Score {signal.get('score', 0)}/{signal.get('max_points', 14)}  |  "
+            f"Accord {signal['confidence']}%  |  ACHAT {ind['buy_points']} pts vs VENTE {ind['sell_points']} pts"
+            + (f"  |  {regime_txt}" if regime_txt else ""))
+    if direction == "ATTENDRE" and signal.get("blocked_by"):
+        sub2 = f"Signal {signal.get('raw_direction', '')} annulé par un filtre de qualité"
+    elif direction == "ATTENDRE":
+        sub2 = "Pas de position conseillée, on observe"
+    else:
+        sub2 = f"Source des cours : {source_label}"
+    if signal.get("stale"):
+        sub2 += "  |  MARCHÉ FERMÉ ou données anciennes : niveaux basés sur la dernière clôture"
+    ax1.set_title(f"{name}  —  {timeframe}    (bougies fermées uniquement)",
+                  color=FG, fontsize=12, fontweight="bold", loc="left", pad=36)
+    ax1.text(0, 1.045, sub1, transform=ax1.transAxes, color=SUB, fontsize=9)
+    ax1.text(0, 1.012, sub2, transform=ax1.transAxes, color=SUB, fontsize=9)
 
     # ------------------------------------------------ RSI
-    ax2.plot(x, rsi_s, color="#b388ff", linewidth=1.3)
+    ax2.plot(x, tail("rsi"), color="#b388ff", linewidth=1.3)
     ax2.axhline(70, color="#e53935", linestyle="--", linewidth=0.8)
     ax2.axhline(30, color="#4caf50", linestyle="--", linewidth=0.8)
     ax2.fill_between(x, 30, 70, color="#4d96ff", alpha=0.06)
     ax2.set_ylim(0, 100)
     ax2.set_ylabel("RSI 14", color=FG, fontsize=9)
-    ax2.text(n + 1.5, 70, "70 surachat", color="#e53935", fontsize=8, va="center")
-    ax2.text(n + 1.5, 30, "30 survente", color="#4caf50", fontsize=8, va="center")
+    ax2.text(n + 1.5, 70, "70", color="#e53935", fontsize=8, va="center")
+    ax2.text(n + 1.5, 30, "30", color="#4caf50", fontsize=8, va="center")
 
     # ------------------------------------------------ MACD
-    ax3.plot(x, macd_line, color="#4d96ff", linewidth=1.2, label="MACD")
-    ax3.plot(x, macd_sig, color="#f4a261", linewidth=1.2, label="Signal")
+    hist = tail("macd_hist")
+    ax3.plot(x, tail("macd_line"), color="#4d96ff", linewidth=1.2, label="MACD")
+    ax3.plot(x, tail("macd_signal"), color="#f4a261", linewidth=1.2, label="Signal")
     ax3.bar(x, hist, color=[UP if v >= 0 else DOWN for v in hist], alpha=0.55, width=0.64)
     ax3.axhline(0, color="#3a3a3a", linewidth=0.8)
     ax3.set_ylabel("MACD", color=FG, fontsize=9)
     ax3.legend(loc="upper left", fontsize=8, facecolor="#1a1c24", edgecolor="#3a3a3a",
                labelcolor=FG, framealpha=0.9, ncols=2)
 
+    # ------------------------------------------------ ADX (régime)
+    ax4.plot(x, tail("adx"), color="#f4c20d", linewidth=1.3, label="ADX")
+    ax4.plot(x, tail("plus_di"), color=UP, linewidth=0.9, label="DI+")
+    ax4.plot(x, tail("minus_di"), color=DOWN, linewidth=0.9, label="DI-")
+    ax4.axhline(settings.ADX_TREND, color="#cccccc", linestyle="--", linewidth=0.8)
+    ax4.text(n + 1.5, settings.ADX_TREND, f"{settings.ADX_TREND:g} tendance", color="#cccccc",
+             fontsize=8, va="center")
+    ax4.set_ylim(0, max(50, float(pd.concat([tail("adx"), tail("plus_di"),
+                                             tail("minus_di")]).max(skipna=True) or 50) + 5))
+    ax4.set_ylabel("ADX 14", color=FG, fontsize=9)
+    ax4.legend(loc="upper left", fontsize=8, facecolor="#1a1c24", edgecolor="#3a3a3a",
+               labelcolor=FG, framealpha=0.9, ncols=3)
+
     # ------------------------------------------------ axe du temps
     ticks = list(range(0, n, max(n // 8, 1)))
-    labels = [d["time"].iloc[i].strftime("%d/%m %H:%M") for i in ticks]
-    ax3.set_xticks(ticks)
-    ax3.set_xticklabels(labels, rotation=0, fontsize=8)
+    fmt = "%d/%m/%y" if timeframe in ("1d", "1w") else "%d/%m %H:%M"
+    ax4.set_xticks(ticks)
+    ax4.set_xticklabels([d["time"].iloc[i].strftime(fmt) for i in ticks], fontsize=8)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=110, facecolor=DARK)

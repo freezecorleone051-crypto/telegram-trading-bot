@@ -2,15 +2,17 @@
 Bot Telegram d'analyse technique de trading — usage privé.
 
 Commandes :
-  /start               menu de démarrage avec boutons
-  /analyse [actif] [tf]  analyse complète + image (ex : /analyse BTC 5m)
-  /prix [actif]        prix en direct + variation 24h
-  /marches             liste des marchés supportés
-  /scan on|off         scan automatique de la watchlist
-  /watch ...           gérer la watchlist (add/remove/clear)
-  /stats               résultats des signaux passés (TP vs SL)
-  /id                  affiche ton ID Telegram
-  /help                aide détaillée
+  /start                 menu de démarrage avec boutons
+  /analyse [actif] [tf]  analyse complète + image (ex : /analyse nvidia 1h)
+  /top [marché] [tf]     classe les opportunités d'une famille (ex : /top actions 1h)
+  /prix [actif]          prix en direct + variation
+  /marches               liste des marchés supportés
+  /scan on|off           scan automatique de la watchlist
+  /watch ...             gérer la watchlist (add/remove/clear)
+  /stats                 résultats réels des signaux passés (en multiples de R)
+  /backtest [actif] [tf] teste le moteur sur l'historique (avec coûts)
+  /id                    affiche ton ID Telegram
+  /help                  aide détaillée
 
 Accès privé : seuls ADMIN_ID et (optionnel) ALLOWED_IDS peuvent l'utiliser.
 """
@@ -24,20 +26,21 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes)
 
 from config import settings
-from core.signal_engine import analyze
+from core.signal_engine import InsufficientData
 from data import feed, markets
 from data.feed import FeedError
 from outputs import chart, messages
-from services import mtf as mtf_service
+from services import backtest as backtest_service
 from services import scanner
-from services.mtf import mtf_verdict
+from services.analysis import full_analysis
 from storage import history
 from utils.logger import setup_logging
-from utils.helpers import time_str
 
 log = setup_logging()
+for _w in settings.CONFIG_WARNINGS:
+    log.warning("Configuration : %s", _w)
 
-ARROW = messages.ARROW
+_scan_lock = asyncio.Lock()
 
 
 # ==================================================================
@@ -55,124 +58,138 @@ def private_guard(func):
         if not allowed(update):
             if update.effective_message:
                 await update.effective_message.reply_text(
-                    "Ce bot est privé. Il n'accepte que son propriétaire.")
+                    "Ce bot est privé. Il n'accepte que son propriétaire. "
+                    "(Pour connaître ton ID Telegram : /id)")
             return
         return await func(update, context)
     return wrapper
 
 
+def _html(text) -> str:
+    return html.escape(str(text))
+
+
+def _parse_asset_tf(tokens: list):
+    """['nvidia', '1h'] -> ('nvidia', '1h') ; ['BTC', 'OTC'] -> ('BTC OTC', None)."""
+    tokens = list(tokens)
+    tf = None
+    if tokens and markets.parse_timeframe(tokens[-1]):
+        tf = markets.parse_timeframe(tokens.pop())
+    return " ".join(tokens), tf
+
+
 # ==================================================================
 # Analyse complète : cours -> signal -> MTF -> image -> messages
 # ==================================================================
-async def run_full_analysis(context: ContextTypes.DEFAULT_TYPE, market: str,
-                            asset: str, timeframe: str):
-    """Chaîne complète. Renvoie (png_bytes, texte, source_label) ou lève FeedError."""
-    df, source_label = await asyncio.to_thread(feed.fetch_candles,
-                                               market, asset, timeframe, 250)
-    signal = await asyncio.to_thread(analyze, df)
+async def run_full_analysis(market: str, asset: str, timeframe: str):
+    """Chaîne complète. Renvoie (png, texte, légende) ou lève FeedError."""
+    res = await asyncio.to_thread(full_analysis, market, asset, timeframe, "always")
+    signal = res["signal"]
+    a = markets.get_asset(market, asset)
+    png = await asyncio.to_thread(
+        chart.make_chart, res["df"], signal, asset, timeframe, res["source"],
+        a.label if a else "", markets.decimals_for(market, asset))
 
-    # contrôle multi-timeframe (courtes erreurs tolérées)
-    mtf_text = None
-    try:
-        mtf_results = await asyncio.to_thread(mtf_service.analyze_mtf,
-                                              market, asset, timeframe)
-        mtf_text = mtf_verdict(mtf_results, signal["direction"])
-    except Exception as e:
-        log.warning("MTF %s %s : %s", asset, timeframe, e)
-
-    png = await asyncio.to_thread(chart.make_chart, df, signal, asset, timeframe,
-                                  source_label)
-
-    # historique : uniquement les signaux confirmés
-    if signal["direction"] != "ATTENDRE":
-        added = await asyncio.to_thread(history.add_signal, signal, market,
-                                        asset, timeframe, source_label)
+    # historique : uniquement les signaux confirmés, sur données fraîches
+    if signal["direction"] != "ATTENDRE" and not res["stale"]:
+        added = await asyncio.to_thread(history.add_signal, signal, market, asset,
+                                        timeframe, res["source"], "manual")
         if added:
-            log.info("Signal enregistré : %s %s %s (%s%%)", asset, timeframe,
-                     signal["direction"], signal["confidence"])
+            log.info("Signal enregistré : %s %s %s (score %s/%s)", asset, timeframe,
+                     signal["direction"], signal["score"], signal["max_points"])
 
-    text = messages.build_signal_message(market, asset, timeframe, signal,
-                                         source_label, mtf_text)
+    text = messages.build_signal_message(market, asset, timeframe, signal, res["source"],
+                                         res["mtf_text"], res["stale"], res["age_s"])
     return png, text, messages.signal_caption(asset, timeframe, signal)
 
 
-def _extract_chat_id(obj) -> int | None:
-    """Retrouve le chat_id quel que soit l'objet reçu.
+async def send_analysis(context: ContextTypes.DEFAULT_TYPE, chat_id: int, market: str,
+                        asset: str, timeframe: str) -> None:
+    """Envoie l'analyse dans le chat `chat_id`.
 
-    - Update (commande /analyse)     -> update.effective_chat.id
-    - CallbackQuery (bouton cliqué)  -> callback.message.chat_id
-    - un chat direct                 -> .chat_id
-    """
-    chat = getattr(obj, "effective_chat", None)
-    if chat is not None:
-        return chat.id
-    msg = getattr(obj, "message", None)
-    if msg is not None:
-        return msg.chat_id
-    return getattr(obj, "chat_id", None)
-
-
-async def send_analysis(update_or_chat, context: ContextTypes.DEFAULT_TYPE,
-                        market: str, asset: str, timeframe: str) -> None:
-    chat_id = _extract_chat_id(update_or_chat)
-    if chat_id is None:
-        log.warning("chat_id introuvable pour l'analyse %s %s : j'envoie a ADMIN_ID",
-                    asset, timeframe)
-        chat_id = settings.ADMIN_ID
-
+    (v1 : on recevait l'objet bouton et on utilisait son `.id` — qui est
+    l'identifiant du CLIC, pas du chat : l'analyse lancée depuis les boutons
+    du menu échouait avec « Chat not found ».)"""
     status = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"Analyse de {asset} en {timeframe}… (cours + 6 modules + contrôle "
-             "multi-timeframe + image)")
+        text=f"Analyse de {asset} en {timeframe}… (cours, régime, 8 modules, contrôle "
+             "multi-timeframe, image)")
     try:
-        png, text, caption = await run_full_analysis(context, market, asset, timeframe)
-    except FeedError as e:
+        png, text, caption = await run_full_analysis(market, asset, timeframe)
+    except (FeedError, InsufficientData) as e:
         await status.edit_text(
             f"Impossible d'analyser {asset} ({timeframe}).\n"
-            f"Détail : {e}\n\nCauses fréquentes : marché fermé (forex le "
-            "week-end), API momentanément indisponible, ou actif mal "
-            "orthographié (voir /marches). Réessaie dans quelques instants.")
+            f"Détail : {e}\n\nCauses fréquentes : marché fermé, API momentanément "
+            "indisponible, ou actif mal orthographié (voir /marches). "
+            "Réessaie dans quelques instants.")
+        return
+    except Exception:
+        log.exception("Analyse %s %s", asset, timeframe)
+        await status.edit_text("Erreur interne pendant l'analyse. Elle est consignée dans "
+                               "les logs ; réessaie dans un instant.")
         return
 
-    await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
     try:
-        await status.delete()
+        await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
         await context.bot.send_photo(chat_id=chat_id, photo=png, caption=caption[:1024])
-    except Exception:
-        await status.edit_text(caption[:4096])
-    await context.bot.send_message(chat_id=chat_id, text=text,
-                                   parse_mode=ParseMode.HTML,
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("Envoi de l'image impossible : %s", e)
+        try:
+            await status.edit_text(caption[:4096])
+        except Exception:
+            pass
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
                                    disable_web_page_preview=True)
 
 
 # ==================================================================
 # Claviers inline
 # ==================================================================
-def market_keyboard():
-    rows = [[InlineKeyboardButton(markets.MARKET_LABELS[m].split(" (")[0],
-                                  callback_data=f"cat:{m}")]
-            for m in ("crypto", "forex", "otc")]
-    rows.append([InlineKeyboardButton("Marchés supportés", callback_data="help:assets")])
-    return InlineKeyboardMarkup(rows)
-
-
-def asset_keyboard(market: str):
-    assets = markets.assets_for(market)
+def market_keyboard(prefix: str = "cat"):
     rows, row = [], []
-    for a in assets:
-        row.append(InlineKeyboardButton(a, callback_data=f"asset:{market}:{a}"))
+    for m in markets.MARKET_ORDER:
+        row.append(InlineKeyboardButton(markets.MARKET_INFO[m]["button"],
+                                        callback_data=f"{prefix}:{m}"))
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
+    if prefix == "cat":
+        rows.append([InlineKeyboardButton("Marchés supportés", callback_data="help:assets")])
+    return InlineKeyboardMarkup(rows)
+
+
+def asset_keyboard(market: str):
+    cols = 2 if market in ("crypto", "forex", "otc") else 3
+    rows, row = [], []
+    for a in markets.assets_for(market):
+        row.append(InlineKeyboardButton(a, callback_data=f"asset:{market}:{a}"))
+        if len(row) == cols:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("Classer les opportunités (/top)",
+                                      callback_data=f"top:{market}")])
     rows.append([InlineKeyboardButton("< Changer de marché", callback_data="back:cat")])
     return InlineKeyboardMarkup(rows)
 
 
 def timeframe_keyboard(market: str, asset: str):
-    rows = [[InlineKeyboardButton(tf, callback_data=f"tf:{market}:{asset}:{tf}")]
-            for tf in markets.TIMEFRAMES]
+    tfs = markets.timeframes_for(market)
+    rows, row = [], []
+    for tf in tfs:
+        row.append(InlineKeyboardButton(tf, callback_data=f"tf:{market}:{asset}:{tf}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     rows.append([InlineKeyboardButton("< Changer d'actif", callback_data=f"cat:{market}")])
     return InlineKeyboardMarkup(rows)
 
@@ -185,19 +202,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Bienvenue ! Je suis ton assistant d'analyse technique de trading.\n\n"
         "<b>Ce que je fais :</b>\n"
-        "- Tu choisis un marché et un timeframe -> j'analyse le graphique avec "
-        "6 modules (EMA 9/21, RSI, MACD, Bollinger, Stochastique, chandeliers "
-        "japonais) et je t'envoie un signal ACHAT / VENTE avec entrée, Take "
-        "Profit et Stop Loss.\n"
-        "- Je contrôle aussi les timeframes supérieurs (multi-timeframe) pour "
-        "dire si le signal est renforcé ou fragile.\n"
-        "- À chaque analyse je t'envoie une <b>image du graphique</b> avec les "
-        "indicateurs et les niveaux tracés.\n"
-        "- Je suis les résultats de mes signaux : /stats donne le taux de "
-        "réussite réel (TP touché vs SL touché).\n"
-        "- Le scan automatique (/scan on) surveille ta watchlist et t'alerte.\n\n"
-        "<b>Commandes :</b> /analyse — /prix — /marches — /scan — /watch — "
-        "/stats — /help — /id\n\n"
+        "- Marchés : crypto, <b>actions US (NVIDIA, Microsoft, Apple…)</b>, ETF, indices "
+        "(S&P 500, Nasdaq, DAX…), matières premières (pétrole, cuivre, argent…), forex et or.\n"
+        "- J'analyse uniquement des bougies <b>fermées</b>, je lis le régime du marché "
+        "(tendance ou range) et je combine 8 modules (EMA, MACD, ADX, RSI, Bollinger, "
+        "stochastique, chandeliers, volume) pour un signal ACHAT / VENTE avec entrée, "
+        "Take Profit et Stop Loss — ou ATTENDRE quand il n'y a rien de propre.\n"
+        "- Je contrôle le timeframe supérieur et je t'envoie l'<b>image du graphique</b>.\n"
+        "- /top classe les opportunités d'une famille de marché.\n"
+        "- /stats donne les résultats RÉELS de mes signaux, /backtest teste le moteur "
+        "sur l'historique : vérifie avant de faire confiance.\n"
+        "- /scan on surveille ta watchlist et t'alerte.\n\n"
+        "<b>Commandes :</b> /analyse — /top — /prix — /marches — /scan — /watch — "
+        "/stats — /backtest — /help — /id\n\n"
         "Choisis une famille de marché :")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML,
                                     reply_markup=market_keyboard())
@@ -208,67 +225,124 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "<b>Aide</b>\n"
         "/start — menu avec boutons\n"
-        "/analyse [actif] [timeframe] — analyse immédiate complète\n"
-        "   ex : /analyse BTC 5m | /analyse EUR/USD 15m | /analyse XAU 1h\n"
-        "/prix [actif] — prix en direct + variation 24h\n"
+        "/analyse [actif] [timeframe] — analyse complète\n"
+        "   ex : /analyse nvidia 1h | /analyse BTC 15m | /analyse or 1h | /analyse dax 1d\n"
+        "/top [marché] [timeframe] — classe les actifs d'une famille\n"
+        "   ex : /top actions 1h | /top crypto 15m | /top indices 1d\n"
+        "/prix [actif] — prix en direct + variation\n"
         "/marches — liste des actifs\n"
         "/scan on / /scan off — scan automatique de la watchlist\n"
-        "/watch add BTC 5m — ajouter à la watchlist\n"
-        "/watch remove BTC 5m — retirer ; /watch clear — tout vider\n"
-        "/stats — taux de réussite des signaux passés\n"
+        "/watch add NVDA 1h — ajouter ; /watch remove NVDA 1h — retirer ; /watch clear\n"
+        "/stats — résultats réels (TP / SL / espérance en R)\n"
+        "/backtest [actif] [timeframe] [nb_bougies] — test sur l'historique, coûts inclus\n"
         "/id — ton ID Telegram\n\n"
-        "<b>Comment je décide (système de points, max 12 par côté) :</b>\n"
-        "- EMA 9/21 + croisement : jusqu'à 4 points\n"
-        "- RSI 14 (zones 30/45/55/70) : jusqu'à 2 points\n"
-        "- MACD + histogramme : jusqu'à 2 points\n"
-        "- Bandes de Bollinger (extrêmes) : 1 point\n"
-        "- Stochastique (croisements en zone 25/75) : 1 point\n"
-        "- Chandeliers japonais (pin bar, englobante, marubozu, 3 soldats...) : "
-        "jusqu'à 2 points\n\n"
-        "Un signal n'est confirmé que si la confiance est au-dessus de "
-        f"{settings.SIGNAL_MIN_CONFIDENCE}%, l'écart de points >= "
-        f"{settings.SIGNAL_MIN_MARGIN} et le côté dominant >= "
-        f"{settings.SIGNAL_MIN_POINTS} points. Sinon je réponds ATTENDRE. "
-        "TP/SL calibrés sur l'ATR (volatilité réelle).")
+        "<b>Comment je décide :</b>\n"
+        "1. Je ne lis que des bougies FERMÉES (aucun signal qui change avant la clôture).\n"
+        "2. L'ADX donne le régime : en TENDANCE (ADX ≥ 25) je suis la tendance "
+        "(EMA 9/21/50, MACD, RSI, Bollinger, stochastique, chandeliers, volume : "
+        "14 points max) ; en RANGE je joue les retours à la moyenne (écart à l'EMA21, "
+        "RSI, Bollinger, stochastique, chandeliers, volume : 10 points max).\n"
+        f"3. Signal confirmé seulement si le côté dominant a ≥ {settings.SIGNAL_MIN_POINTS} "
+        f"points (échelle tendance), un écart ≥ {settings.SIGNAL_MIN_MARGIN} et un accord "
+        f"≥ {settings.SIGNAL_MIN_CONFIDENCE}%. Sinon : ATTENDRE.\n"
+        f"4. Filtres : marché trop calme (ATR < {settings.MIN_ATR_PCT:g}%), entrée tardive "
+        f"(RSI extrême), données anciennes (marché fermé), et — en tendance — signal "
+        f"contre le timeframe supérieur (mode {settings.MTF_FILTER}).\n"
+        f"5. TP = {settings.TP_ATR:g} x ATR, SL = {settings.SL_ATR:g} x ATR.\n\n"
+        "<b>Important :</b> « accord » n'est pas une probabilité de gagner. "
+        "Seuls /stats (réel) et /backtest (historique) mesurent l'efficacité.")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 @private_guard
 async def cmd_analyse(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "Quel marché veux-tu analyser ? Choisis la famille :",
-            reply_markup=market_keyboard())
+    if not context.args:
+        await update.message.reply_text("Quel marché veux-tu analyser ? Choisis la famille :",
+                                        reply_markup=market_keyboard())
         return
-
-    tf = "5m"
-    tokens = list(args)
-    if tokens and tokens[-1].lower() in markets.TIMEFRAMES:
-        tf = tokens.pop().lower()
-
-    match = markets.find_asset(" ".join(tokens))
+    query, tf = _parse_asset_tf(context.args)
+    match = markets.find_asset(query)
     if not match:
         await update.message.reply_text(
-            "Actif non reconnu. Voici ce que je connais :\n/marches\n\n"
-            "Exemples : /analyse BTC 5m — /analyse EUR/USD 15m — /analyse XAU 1h "
-            "— /analyse BTC OTC 5m")
+            "Actif non reconnu. Voici ce que je connais : /marches\n\n"
+            "Exemples : /analyse nvidia 1h — /analyse BTC 15m — /analyse or 1h "
+            "— /analyse dax 1d — /analyse BTC OTC 5m")
         return
     market, asset = match
-    await send_analysis(update, context, market, asset, tf)
+    tf = tf or markets.default_timeframe(market)
+    if tf not in markets.fetchable_timeframes(market):
+        await update.message.reply_text(
+            f"{asset} n'existe pas en {tf}. Timeframes disponibles : "
+            + ", ".join(markets.timeframes_for(market)))
+        return
+    await send_analysis(context, update.effective_chat.id, market, asset, tf)
 
 
 @private_guard
 async def cmd_marches(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "<b>Marchés supportés</b>\n\n"
-        "<b>Crypto</b> (cours Binance) : " + ", ".join(markets.CRYPTO_ASSETS) + "\n\n"
-        "<b>Forex & Or</b> (cours Yahoo) : " + ", ".join(markets.FOREX_ASSETS) + "\n\n"
-        "<b>OTC / Binaires</b> (cours du même actif ailleurs -> même graphique) : "
-        + ", ".join(markets.OTC_ASSETS) + "\n\n"
-        "Timeframes : " + ", ".join(markets.TIMEFRAMES) + "\n\n"
-        "Exemples : /analyse BTC 5m — /analyse XAU/USD 15m — /analyse EUR/USD OTC 1m")
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(messages.build_markets_message(),
+                                    parse_mode=ParseMode.HTML)
+
+
+async def _run_top(context: ContextTypes.DEFAULT_TYPE, chat_id: int, market: str,
+                   timeframe: str):
+    n = len(markets.assets_for(market))
+    status = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Analyse de {n} actifs ({markets.MARKET_INFO[market]['button']}, {timeframe})… "
+             "environ 10 à 30 secondes.")
+    try:
+        ranked, no_signal, errors, stale = await scanner.rank_opportunities(market, timeframe)
+    except Exception:
+        log.exception("/top %s %s", market, timeframe)
+        await status.edit_text("Erreur interne pendant le classement. Réessaie dans un instant.")
+        return
+    if errors and len(errors) == n:
+        await status.edit_text("Aucune donnée disponible pour cette famille en ce moment "
+                               "(API indisponible ?). Réessaie dans quelques minutes.")
+        return
+    await status.edit_text(
+        messages.build_top_message(market, timeframe, ranked, no_signal, errors, stale),
+        parse_mode=ParseMode.HTML)
+
+
+@private_guard
+async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Quelle famille classer ? (ou tape /top actions 1h)",
+            reply_markup=market_keyboard("top"))
+        return
+    market = markets.parse_market(context.args[0])
+    if not market:
+        await update.message.reply_text(
+            "Famille inconnue. Choisis : crypto, actions, etf, indices, matieres, forex, otc.\n"
+            "Exemple : /top actions 1h")
+        return
+    tf = (markets.parse_timeframe(context.args[1]) if len(context.args) > 1
+          else markets.default_timeframe(market))
+    if not tf or tf not in markets.fetchable_timeframes(market):
+        await update.message.reply_text("Timeframe invalide pour cette famille. Disponibles : "
+                                        + ", ".join(markets.timeframes_for(market)))
+        return
+    await _run_top(context, update.effective_chat.id, market, tf)
+
+
+# ------------------------------------------------------------------
+# Scan automatique
+# ------------------------------------------------------------------
+def _start_scan_job(job_queue) -> bool:
+    if job_queue is None:
+        return False
+    if job_queue.get_jobs_by_name("scan"):
+        return True
+    job_queue.run_repeating(scan_job, interval=settings.SCAN_INTERVAL_MIN * 60, first=10,
+                            name="scan", chat_id=settings.ADMIN_ID)
+    return True
+
+
+def _watch_text(watch) -> str:
+    return ", ".join(f"{a} ({tf})" for _m, a, tf in watch) or "(vide)"
 
 
 @private_guard
@@ -278,75 +352,77 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     watch = history.get_watchlist()
 
     if arg == "on":
+        if context.job_queue is None:
+            await update.message.reply_text(
+                "Le planificateur n'est pas disponible. Installe : "
+                "pip install \"python-telegram-bot[job-queue]\"")
+            return
         if jobs:
             await update.message.reply_text(
-                f"Le scan automatique est DÉJÀ actif (toutes les "
-                f"{settings.SCAN_INTERVAL_MIN} min). Watchlist : "
-                + ", ".join(f"{a} ({tf})" for _m, a, tf in watch))
+                f"Le scan automatique est DÉJÀ actif (toutes les {settings.SCAN_INTERVAL_MIN} "
+                f"min). Watchlist : {_watch_text(watch)}")
             return
-        context.job_queue.run_repeating(scan_job,
-                                        interval=settings.SCAN_INTERVAL_MIN * 60,
-                                        first=10, name="scan", chat_id=settings.ADMIN_ID)
+        _start_scan_job(context.job_queue)
+        await asyncio.to_thread(history.set_scan_enabled, True)
         await update.message.reply_text(
-            f"Scan automatique ACTIVÉ : je surveille "
-            + ", ".join(f"{a} ({tf})" for _m, a, tf in watch)
-            + f" toutes les {settings.SCAN_INTERVAL_MIN} min. Je t'enverrai le "
-              "message + l'image dès qu'un signal confirmé sort, et je suis "
-              "aussi les résultats (voir /stats).")
+            f"Scan automatique ACTIVÉ : je surveille {_watch_text(watch)} toutes les "
+            f"{settings.SCAN_INTERVAL_MIN} min. Je t'enverrai le message + l'image dès qu'un "
+            "signal confirmé sort, puis le résultat (TP / SL) quand il tombe. Le scan "
+            "reste activé après un redémarrage du bot.")
     elif arg == "off":
         for j in jobs:
             j.schedule_removal()
+        await asyncio.to_thread(history.set_scan_enabled, False)
         await update.message.reply_text("Scan automatique DÉSACTIVÉ.")
     else:
         state = "actif" if jobs else "arrêté"
         await update.message.reply_text(
             f"Scan automatique : actuellement {state}.\n"
             "/scan on pour démarrer — /scan off pour arrêter.\n"
-            "Watchlist : " + ", ".join(f"{a} ({m} {tf})" for m, a, tf in watch))
+            f"Watchlist : {_watch_text(watch)}")
 
 
 @private_guard
 async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args or args[0].lower() not in ("add", "remove", "clear", "list"):
-        await update.message.reply_text(messages.build_watchlist_message(
-            history.get_watchlist()))
+        await update.message.reply_text(
+            messages.build_watchlist_message(history.get_watchlist()),
+            parse_mode=ParseMode.HTML)
         return
-
     action = args[0].lower()
     if action == "clear":
         await asyncio.to_thread(history.watchlist_clear)
         await update.message.reply_text("Watchlist vidée.")
         return
     if action == "list" or len(args) < 2:
-        await update.message.reply_text(messages.build_watchlist_message(
-            history.get_watchlist()))
+        await update.message.reply_text(
+            messages.build_watchlist_message(history.get_watchlist()),
+            parse_mode=ParseMode.HTML)
         return
 
-    tf = "5m"
-    tokens = list(args[1:])
-    if tokens and tokens[-1].lower() in markets.TIMEFRAMES:
-        tf = tokens.pop().lower()
-    match = markets.find_asset(" ".join(tokens))
+    query, tf = _parse_asset_tf(args[1:])
+    match = markets.find_asset(query)
     if not match:
         await update.message.reply_text(
-            "Actif non reconnu (voir /marches). Exemple : /watch add ETH 15m")
+            "Actif non reconnu (voir /marches). Exemple : /watch add nvidia 1h")
         return
     market, asset = match
+    tf = tf or markets.default_timeframe(market)
     if action == "add":
-        ok = await asyncio.to_thread(history.watchlist_add, market, asset, tf)
-        if ok:
+        if tf not in markets.fetchable_timeframes(market):
             await update.message.reply_text(
-                f"{asset} ({tf}) ajouté à la watchlist. Si le scan est actif "
-                "(/scan on), il sera surveillé.")
-        else:
-            await update.message.reply_text(f"{asset} ({tf}) est déjà dans la "
-                                            "watchlist.")
-    else:  # remove
+                f"{asset} n'existe pas en {tf}. Disponibles : "
+                + ", ".join(markets.timeframes_for(market)))
+            return
+        ok = await asyncio.to_thread(history.watchlist_add, market, asset, tf)
+        await update.message.reply_text(
+            f"{asset} ({tf}) ajouté à la watchlist. Si le scan est actif (/scan on), il sera "
+            "surveillé." if ok else f"{asset} ({tf}) est déjà dans la watchlist.")
+    else:
         ok = await asyncio.to_thread(history.watchlist_remove, market, asset, tf)
         await update.message.reply_text(f"{asset} ({tf}) retiré." if ok
-                                        else f"{asset} ({tf}) n'était pas dans "
-                                             "la watchlist.")
+                                        else f"{asset} ({tf}) n'était pas dans la watchlist.")
 
 
 @private_guard
@@ -357,12 +433,55 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         closed = await asyncio.to_thread(history.update_open_signals, feed.fetch_candles)
     except Exception as e:
         log.warning("update_open_signals : %s", e)
-        closed = 0
+        closed = []
     st = await asyncio.to_thread(history.stats)
-    head = (f"Mise à jour : {closed} signal(aux) clôturé(s) depuis la dernière "
+    head = (f"Mise à jour : {len(closed)} signal(aux) clôturé(s) depuis la dernière "
             "vérification.\n\n") if closed else ""
-    await status.edit_text(head + messages.build_stats_message(st),
-                           parse_mode=ParseMode.HTML)
+    await status.edit_text(head + messages.build_stats_message(st), parse_mode=ParseMode.HTML)
+
+
+@private_guard
+async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Teste le moteur sur l'historique d'un actif (coûts inclus).\n"
+            "Exemples : /backtest nvidia 1h — /backtest BTC 15m 3000 — /backtest eurusd 15m\n"
+            "Plus il y a de trades, plus le résultat est fiable (≥ 30 minimum).")
+        return
+    tokens = list(context.args)
+    bars = 1500
+    if tokens and tokens[-1].isdigit():
+        bars = min(max(int(tokens.pop()), 300), 5000)
+    query, tf = _parse_asset_tf(tokens)
+    match = markets.find_asset(query)
+    if not match:
+        await update.message.reply_text("Actif non reconnu (voir /marches).")
+        return
+    market, asset = match
+    tf = tf or markets.default_timeframe(market)
+    if tf not in markets.fetchable_timeframes(market):
+        await update.message.reply_text(f"{asset} n'existe pas en {tf}.")
+        return
+    status = await update.message.reply_text(
+        f"Backtest de {asset} en {tf} sur ~{bars} bougies… (quelques secondes)")
+    try:
+        df, source = await asyncio.to_thread(feed.fetch_history, market, asset, tf, bars)
+        out = await asyncio.to_thread(
+            backtest_service.run_backtest, df, tf, market,
+            backtest_service.DEFAULT_COST_PCT.get(market, 0.05), None, 80,
+            settings.MTF_FILTER == "strict", markets.decimals_for(market, asset))
+    except (FeedError, InsufficientData) as e:
+        await status.edit_text(f"Backtest impossible : {e}")
+        return
+    except Exception:
+        log.exception("/backtest %s %s", asset, tf)
+        await status.edit_text("Erreur interne pendant le backtest (voir les logs).")
+        return
+    report = backtest_service.format_report(asset, tf, out["summary"], source)
+    await status.edit_text(
+        "<pre>" + _html(report) + "</pre>\n<i>" + _html(
+            "Simulation sur le passé : jamais une promesse pour le futur. "
+            + settings.DISCLAIMER) + "</i>", parse_mode=ParseMode.HTML)
 
 
 @private_guard
@@ -374,23 +493,19 @@ async def cmd_prix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     market, asset = match
     try:
-        df, source_label = await asyncio.to_thread(feed.fetch_candles,
-                                                   market, asset, "1h", 30)
+        info = await asyncio.to_thread(feed.fetch_price, market, asset)
     except FeedError as e:
         await update.message.reply_text(
-            f"Prix indisponible pour {asset} : {e}\n(marché fermé le week-end "
-            "pour le forex ?)")
+            f"Prix indisponible pour {asset} : {e}\n(marché fermé ? API indisponible ?)")
         return
-    price = float(df["close"].iloc[-1])
-    ref = float(df["close"].iloc[-25]) if len(df) > 25 else float(df["close"].iloc[0])
-    change = (price - ref) / ref * 100 if ref else None
     await update.message.reply_text(
-        messages.build_price_message(asset, price, change, source_label),
+        messages.build_price_message(asset, info["price"], info["change_pct"], info["source"],
+                                     info["span"], markets.decimals_for(market, asset), query),
         parse_mode=ParseMode.HTML)
 
 
-@private_guard
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Volontairement SANS garde : il faut pouvoir lire son ID avant d'être autorisé."""
     await update.message.reply_text(
         f"Ton ID Telegram : <b>{update.effective_user.id}</b>\n"
         "Mets-le dans le fichier .env (ADMIN_ID=...) pour l'accès privé.",
@@ -400,90 +515,87 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================================================================
 # Boutons
 # ==================================================================
+async def _edit(query, text: str, **kw):
+    try:
+        await query.edit_message_text(text, **kw)
+    except Exception as e:      # ex. « Message is not modified »
+        log.debug("edit_message_text : %s", e)
+
+
 @private_guard
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data or ""
     await query.answer()
+    chat_id = update.effective_chat.id
 
     if data == "back:cat" or data.startswith("cat:"):
         market = data.split(":", 1)[1] if ":" in data else ""
-        if market in markets.MARKET_LABELS:
-            await query.edit_message_text(
-                f"Marché : {markets.MARKET_LABELS[market]}\nChoisis l'actif :",
-                reply_markup=asset_keyboard(market))
+        if market in markets.MARKET_INFO:
+            await _edit(query, f"Marché : {markets.MARKET_LABELS[market]}\nChoisis l'actif :",
+                        reply_markup=asset_keyboard(market))
         else:
-            await query.edit_message_text("Quelle famille de marché ?",
-                                          reply_markup=market_keyboard())
+            await _edit(query, "Quelle famille de marché ?", reply_markup=market_keyboard())
     elif data.startswith("asset:"):
         _, market, asset = data.split(":", 2)
-        await query.edit_message_text(
-            f"{asset} — choisis le timeframe :",
-            reply_markup=timeframe_keyboard(market, asset))
+        await _edit(query, f"{asset} — choisis le timeframe :",
+                    reply_markup=timeframe_keyboard(market, asset))
     elif data.startswith("tf:"):
         _, market, asset, tf = data.split(":", 3)
-        # NOTE : on passe l'Update complet (il porte la conversation d'origine),
-        # pas la CallbackQuery — sinon le chat_id est introuvable ("Chat not found").
-        await send_analysis(update, context, market, asset, tf)
+        await send_analysis(context, chat_id, market, asset, tf)
+    elif data.startswith("top:"):
+        market = data.split(":", 1)[1]
+        if market in markets.MARKET_INFO:
+            await _run_top(context, chat_id, market, markets.default_timeframe(market))
     elif data == "help:assets":
-        await query.edit_message_text(
-            "Crypto : " + ", ".join(markets.CRYPTO_ASSETS) + "\n"
-            "Forex : " + ", ".join(markets.FOREX_ASSETS) + "\n"
-            "OTC : " + ", ".join(markets.OTC_ASSETS) + "\n\n"
-            "Envoie /analyse BTC 5m pour une analyse directe.",
-            reply_markup=market_keyboard())
+        await _edit(query, "Envoie /marches pour la liste complète, ou /analyse nvidia 1h "
+                           "pour une analyse directe.", reply_markup=market_keyboard())
 
 
 # ==================================================================
 # Job du scan automatique
 # ==================================================================
 async def scan_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        alerts = await scanner.run_scan(context.bot, settings.ADMIN_ID)
-        if alerts:
-            log.info("Scan terminé : %s alerte(s) envoyée(s)", alerts)
-    except Exception as e:
-        log.error("Scan en erreur : %s", e)
+    if _scan_lock.locked():
+        log.info("Scan précédent encore en cours : cycle ignoré")
+        return
+    async with _scan_lock:
+        try:
+            alerts = await scanner.run_scan(context.bot, settings.ADMIN_ID)
+            if alerts:
+                log.info("Scan terminé : %s alerte(s) envoyée(s)", alerts)
+        except Exception:
+            log.exception("Scan en erreur")
 
 
-# ==================================================================
-# Erreurs non gérées : log propre au lieu d'une traceback géante
-# ==================================================================
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Erreur non gérée : %s", context.error)
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    """Gestionnaire global : consigne l'erreur et prévient l'utilisateur."""
+    log.error("Erreur non gérée : %s", context.error, exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Une erreur inattendue est survenue (consignée dans les logs). Réessaie.")
+        except Exception:
+            pass
 
 
 # ==================================================================
 # Démarrage
 # ==================================================================
 async def post_init(application: Application):
-    if settings.AUTO_SCAN:
-        if application.job_queue is None:
-            raise RuntimeError(
-                "AUTO_SCAN est activé, mais la file de tâches Telegram "
-                "n'est pas disponible."
-            )
-        if not application.job_queue.get_jobs_by_name("scan"):
-            application.job_queue.run_repeating(
-                scan_job,
-                interval=settings.SCAN_INTERVAL_MIN * 60,
-                first=10,
-                name="scan",
-                chat_id=settings.ADMIN_ID,
-            )
-            log.info("Scan automatique démarré toutes les %s minutes.",
-                     settings.SCAN_INTERVAL_MIN)
-
+    resumed = False
+    if settings.SCAN_AUTOSTART or history.get_scan_enabled():
+        resumed = _start_scan_job(application.job_queue)
     try:
         await application.bot.send_message(
             chat_id=settings.ADMIN_ID,
-            text="Bot démarré ! /start pour choisir un marché, /scan on pour "
-                 "le scan automatique, /stats pour les résultats des signaux, "
-                 "/help pour tout voir.")
+            text="Bot démarré ! /start pour choisir un marché, /top pour classer les "
+                 "opportunités, /scan on pour le scan automatique, /stats et /backtest pour "
+                 "mesurer l'efficacité, /help pour tout voir."
+                 + ("\nScan automatique : REPRIS." if resumed else ""))
     except Exception as e:
-        log.warning("Message de démarrage non envoyé (%s) — normal si tu n'as "
-                    "pas encore ouvert la discussion avec le bot (appuie sur "
-                    "START dans Telegram, puis /start).", e)
+        log.warning("Message de démarrage non envoyé : %s", e)
 
 
 def main():
@@ -491,26 +603,21 @@ def main():
         raise SystemExit("BOT_TOKEN manquant : crée le fichier .env (voir .env.example)")
     if not settings.ADMIN_ID:
         raise SystemExit("ADMIN_ID manquant : récupère ton ID via @userinfobot "
-                         "et remplis le .env")
+                         "(ou la commande /id du bot) et remplis le .env")
 
-    log.info("Démarrage — scan %s min, confiance mini %s%%, points mini %s, "
-             "marge mini %s", settings.SCAN_INTERVAL_MIN,
-             settings.SIGNAL_MIN_CONFIDENCE, settings.SIGNAL_MIN_POINTS,
-             settings.SIGNAL_MIN_MARGIN)
+    log.info("Démarrage — scan %s min, points mini %s, marge mini %s, accord mini %s%%, MTF %s",
+             settings.SCAN_INTERVAL_MIN, settings.SIGNAL_MIN_POINTS,
+             settings.SIGNAL_MIN_MARGIN, settings.SIGNAL_MIN_CONFIDENCE, settings.MTF_FILTER)
 
-    app = Application.builder().token(settings.BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("analyse", cmd_analyse))
-    app.add_handler(CommandHandler("marches", cmd_marches))
-    app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("watch", cmd_watch))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("prix", cmd_prix))
-    app.add_handler(CommandHandler("id", cmd_id))
+    app = (Application.builder().token(settings.BOT_TOKEN).post_init(post_init)
+           .concurrent_updates(True).build())
+    for name, fn in (("start", cmd_start), ("help", cmd_help), ("analyse", cmd_analyse),
+                     ("top", cmd_top), ("marches", cmd_marches), ("scan", cmd_scan),
+                     ("watch", cmd_watch), ("stats", cmd_stats), ("backtest", cmd_backtest),
+                     ("prix", cmd_prix), ("id", cmd_id)):
+        app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
-
     app.run_polling(drop_pending_updates=True)
 
 

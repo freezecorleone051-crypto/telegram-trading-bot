@@ -60,8 +60,11 @@ def test_points_dans_limites():
     random.seed(5)
     prices = [100 + random.uniform(-1, 1) for _ in range(150)]
     sig = analyze(_df(prices))
-    assert 0 <= sig["buy_points"] <= 12
-    assert 0 <= sig["sell_points"] <= 12
+    # En régime range le max est 10 ; en régime tendance le max est 14 (MAX_POINTS).
+    # On vérifie que chaque côté ne dépasse pas le maximum global du moteur.
+    from core.signal_engine import MAX_POINTS
+    assert 0 <= sig["buy_points"] <= MAX_POINTS
+    assert 0 <= sig["sell_points"] <= MAX_POINTS
     assert sig["rr"] >= 0
 
 
