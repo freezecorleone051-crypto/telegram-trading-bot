@@ -1,7 +1,7 @@
 """Market data providers and candle handling.
 
-Deriv is queried first for instruments it actually lists. Binance is the
-crypto fallback and Yahoo Finance covers other markets and provider outages.
+Deriv is queried first across all supported market families. Binance and Yahoo
+Finance remain fallbacks for unlisted instruments or provider outages.
 """
 import json
 import logging
@@ -159,14 +159,20 @@ def _resolve_deriv_symbol(market, asset, symbols):
     if item is None:
         return None
 
+    underlying_name = item.name
+    if market == "otc" and underlying_name.upper().endswith(" OTC"):
+        underlying_name = underlying_name[:-4].strip()
     display_names = {
         _symbol_key(value) for value in (item.name, item.label, *item.aliases)
         if value
     }
-    compact_pair = _symbol_key(item.name)
+    display_names.add(_symbol_key(underlying_name))
     crypto_base = (item.binance[:-4] if item.binance and
                    item.binance.endswith("USDT") else None)
-    crypto_pair = _symbol_key(f"{crypto_base}USD") if crypto_base else None
+    pair_tail = (_symbol_key(f"{crypto_base}USD") if crypto_base
+                 else _symbol_key(underlying_name))
+    if "/" in underlying_name:
+        display_names.add(pair_tail)
 
     exact_display = []
     exact_symbol = []
@@ -177,16 +183,20 @@ def _resolve_deriv_symbol(market, asset, symbols):
             exact_display.append(symbol)
             continue
         normalized_symbol = _symbol_key(symbol)
-        if (compact_pair and normalized_symbol.endswith(compact_pair)
-                and market in ("forex", "otc")):
-            exact_symbol.append(symbol)
-        elif crypto_pair and normalized_symbol.endswith(crypto_pair):
+        if ("/" in underlying_name and pair_tail
+                and normalized_symbol.endswith(pair_tail)):
             exact_symbol.append(symbol)
         elif normalized_symbol in display_names:
             exact_symbol.append(symbol)
 
     matches = exact_display or exact_symbol
     unique = list(dict.fromkeys(symbol for symbol in matches if symbol))
+    if len(unique) > 1 and ("/" in underlying_name or crypto_base):
+        prefix = "cry" if crypto_base else "frx"
+        preferred = [symbol for symbol in unique
+                     if symbol.upper().startswith(prefix.upper())]
+        if len(preferred) == 1:
+            return preferred[0]
     return unique[0] if len(unique) == 1 else None
 
 
@@ -225,6 +235,33 @@ def _fetch_deriv(market, asset, timeframe, limit):
     if timeframe == "1w":
         frame = _resample(frame, "1w")
     return frame, "Deriv"
+
+
+def _fetch_deriv_tick(market, asset):
+    """Fetch one current Deriv tick without subscribing to a long-lived stream."""
+    if not settings.DERIV_APP_ID:
+        raise FeedError("DERIV_APP_ID n'est pas configuré")
+    try:
+        symbol = _resolve_deriv_symbol(market, asset, _get_deriv_symbols())
+        if not symbol:
+            raise FeedError(f"{asset} n'est pas disponible chez Deriv")
+        with websockets.sync.client.connect(
+                DERIV_WS_URL.format(app_id=settings.DERIV_APP_ID),
+                open_timeout=5, close_timeout=2, max_size=2**20) as connection:
+            response = _deriv_request(connection, {"ticks": symbol})
+    except FeedError:
+        raise
+    except Exception as exc:
+        raise FeedError(f"flux temps réel Deriv indisponible ({type(exc).__name__})") from exc
+
+    tick = response.get("tick")
+    if not isinstance(tick, dict) or tick.get("quote") is None:
+        raise FeedError("Deriv n'a renvoyé aucun tick")
+    try:
+        price = float(tick["quote"])
+    except (TypeError, ValueError) as exc:
+        raise FeedError("prix Deriv invalide") from exc
+    return {"price": price, "epoch": tick.get("epoch")}
 
 
 def _resample(frame, timeframe):
@@ -341,15 +378,42 @@ def fetch_history(market, asset, timeframe, bars):
 
 
 def fetch_price(market, asset):
-    frame, source = fetch_candles(market, asset, "1h", 48)
-    close = frame["close"].astype(float)
-    if len(close) < 2:
-        raise FeedError(f"pas assez de cours pour {asset}")
-    current = float(close.iloc[-1])
-    previous = float(close.iloc[max(0, len(close) - 25)])
-    change_pct = ((current / previous) - 1) * 100 if previous else 0.0
+    hourly = None
+    history_source = None
+    history_error = None
+    try:
+        hourly, history_source = fetch_candles(market, asset, "1h", 48)
+    except FeedError as exc:
+        history_error = exc
+
+    try:
+        tick = _fetch_deriv_tick(market, asset)
+        current = tick["price"]
+        source = "Deriv"
+        live = True
+    except FeedError as exc:
+        log.info("Tick Deriv indisponible pour %s: %s", asset, exc)
+        try:
+            recent, source = fetch_candles(market, asset, "1m", 60)
+        except FeedError:
+            if hourly is None:
+                raise FeedError(f"prix indisponible pour {asset}: {history_error or exc}") from exc
+            recent, source = hourly, history_source
+        current = float(recent["close"].iloc[-1])
+        live = False
+
+    change_pct = None
+    if hourly is not None and len(hourly) >= 2:
+        close = hourly["close"].astype(float)
+        previous = float(close.iloc[max(0, len(close) - 25)])
+        if previous:
+            change_pct = ((current / previous) - 1) * 100
+    if live and history_source and history_source != "Deriv":
+        source = f"Deriv (tick live), variation {history_source}"
+    elif not live:
+        source = f"{source} (dernière bougie)"
     return {"price": current, "change_pct": change_pct,
-            "span": "sur 24h", "source": source}
+            "span": "sur 24h", "source": source, "live": live}
 
 
 def _session_for(market, asset):

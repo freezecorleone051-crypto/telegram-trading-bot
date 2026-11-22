@@ -163,13 +163,15 @@ def build_stats_message(st: dict) -> str:
 
 def build_price_message(asset: str, price: float, change_pct: float | None,
                         source_label: str, span: str = "sur 24h",
-                        decimals: int | None = None, query: str | None = None) -> str:
+                        decimals: int | None = None, query: str | None = None,
+                        live: bool = False) -> str:
     ch = (f"{change_pct:+.2f}% {span}" if change_pct is not None
           else f"variation {span} indisponible")
     shown = f"{price:.{decimals}f}" if decimals is not None else f"{indicators.smart_round(price):g}"
     q = query or asset.replace("/USDT", "")
+    freshness = "tick en direct" if live else "dernière bougie disponible"
     return (f"<b>{html.escape(asset)}</b> : {shown}\n"
-            f"{ch}\nSource : {html.escape(source_label)}\n\n"
+            f"{ch}\nCours : {freshness}\nSource : {html.escape(source_label)}\n\n"
             f"Analyse complète : /analyse {html.escape(q)}")
 
 

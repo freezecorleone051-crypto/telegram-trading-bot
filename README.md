@@ -165,7 +165,7 @@ pas à ton broker :
 
 | Famille | Ordre des sources | Actifs |
 |---|---|---|
-| Toutes les familles | **Deriv** si l'instrument exact est listé, puis source de secours | Forex, crypto et instruments Deriv disponibles |
+| Toutes les familles | **Deriv en premier** si l'instrument exact est listé, puis source de secours | Forex, crypto et instruments Deriv disponibles |
 | Crypto | **Deriv → Binance → Yahoo Finance** | BTC, ETH, BNB, SOL, XRP, ADA, DOGE (USDT) |
 | Forex, actions, ETF, indices, matières premières | **Deriv → Yahoo Finance** | Actifs du catalogue, uniquement si le symbole Deriv correspond exactement |
 | OTC / binaires | Données de l'actif réel correspondant ; Deriv en priorité s'il est listé | EUR/USD OTC, GBP/USD OTC, USD/JPY OTC, XAU/USD OTC, BTC/USD OTC, ETH/USD OTC |
@@ -173,15 +173,14 @@ pas à ton broker :
 - Les données de marché publiques Deriv ne nécessitent pas de jeton personnel.
 - Binance et Yahoo Finance sont utilisés automatiquement si Deriv ne propose pas
   l'actif ou si son flux est indisponible.
+- `/prix` demande le dernier tick Deriv en direct ; si Deriv ne fournit pas ce
+  symbole, le bot affiche la dernière bougie disponible de la source de secours.
+- Les analyses techniques utilisent des bougies clôturées pour éviter de baser
+  un signal sur une bougie encore incomplète.
+- `/analyse` démarre immédiatement, sans pause ni deuxième passe forcée.
 - Le forex ferme le week-end : "aucune donnée" samedi/dimanche est normal.
 - Ton broker peut afficher un écart minuscule (spread) : vérifie l'entrée sur
   ta plateforme avant de trader.
-
-Les analyses manuelles `/analyse` attendent 20 secondes puis recalculent le
-signal sur des cours actualisés. Si la direction change entre les deux passes,
-le bot répond `ATTENDRE`. Ce délai est réglable via
-`ANALYSIS_CONFIRMATION_SECONDS` (0 pour le désactiver) ; il ne garantit pas
-qu'un signal soit rentable.
 
 ---
 
@@ -202,9 +201,8 @@ qu'un signal soit rentable.
 | `TP_ATR` / `SL_ATR` | 1.5 / 1.0 | calibration TP/SL sur l'ATR |
 | `TZ_NAME` | Africa/Lubumbashi | fuseau affiché |
 | `NB_CANDLES_CHART` | 80 | bougies dessinées sur l'image |
-| `FEED_CACHE_TTL` | 25 | cache des cours (secondes) |
+| `FEED_CACHE_TTL` | 5 | cache court des bougies (secondes) |
 | `DERIV_APP_ID` | 1089 | ID d'application public utilisé par le WebSocket Deriv |
-| `ANALYSIS_CONFIRMATION_SECONDS` | 20 | délai avant confirmation d'une analyse manuelle |
 
 Pour ajouter des actifs : `data/markets.py` (`CRYPTO_ASSETS`, `FOREX_ASSETS`,
 `OTC_ASSETS`, `OTC_ROUTE`).

@@ -141,12 +141,13 @@ SL_ATR = _num("SL_ATR", 1.0, float)
 # ------------------------------------------------------------------
 TZ_NAME = os.getenv("TZ_NAME", "Africa/Lubumbashi").strip() or "Africa/Lubumbashi"
 NB_CANDLES_CHART = _num("NB_CANDLES_CHART", 80, int)
-# Durée du cache des cours en secondes (évite de marteler les API).
-FEED_CACHE_TTL = _num("FEED_CACHE_TTL", 25, int)
+# Cache court pour garder les cours frais sans multiplier les appels API.
+FEED_CACHE_TTL = max(0, _num("FEED_CACHE_TTL", 5, int))
+if FEED_CACHE_TTL > 5:
+    CONFIG_WARNINGS.append("FEED_CACHE_TTL est limité à 5 s pour garder les cours frais")
+    FEED_CACHE_TTL = 5
 # ID public de l'application Deriv (les endpoints de données marché sont publics).
 DERIV_APP_ID = _num("DERIV_APP_ID", 1089, int)
-# Deux analyses séparées dans le temps doivent confirmer le signal avant envoi.
-ANALYSIS_CONFIRMATION_SECONDS = max(0, _num("ANALYSIS_CONFIRMATION_SECONDS", 20, int))
 
 DATA_DIR = PROJECT_ROOT / "data_store"
 LOG_DIR = PROJECT_ROOT / "logs"

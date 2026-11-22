@@ -16,24 +16,6 @@ from services import mtf as mtf_service
 log = logging.getLogger("tradingbot.analysis")
 
 
-def reconcile_confirmation(first: dict, confirmed: dict, delay_seconds: int) -> dict:
-    """Keep a signal only when its direction survives the delayed re-analysis."""
-    first_direction = first["signal"]["direction"]
-    confirmed_direction = confirmed["signal"]["direction"]
-    if first_direction == confirmed_direction:
-        return confirmed
-
-    signal = confirmed["signal"]
-    signal["initial_direction"] = first_direction
-    signal["confirmed_direction"] = confirmed_direction
-    signal["direction"] = "ATTENDRE"
-    signal["blocked_by"] = f"confirmation {delay_seconds} secondes"
-    signal["reasons"].append(
-        f"CONFIRMATION : le signal a changé après {delay_seconds} s "
-        f"({first_direction} puis {confirmed_direction}) ; décision prudente : ATTENDRE.")
-    return confirmed
-
-
 def full_analysis(market: str, asset: str, timeframe: str,
                   mtf_mode: str = "always", fetch=None) -> dict:
     """Analyse complète d'un actif.

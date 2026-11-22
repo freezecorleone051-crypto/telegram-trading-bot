@@ -1,4 +1,4 @@
-"""Couche de données testée HORS RÉSEAU (requests / yfinance simulés)."""
+"""Couche de données testée hors réseau (HTTP et WebSocket simulés)."""
 import json
 
 import pandas as pd
@@ -9,6 +9,7 @@ from data import feed, markets
 from data.feed import FeedError
 
 _fetch_deriv = feed._fetch_deriv
+_fetch_deriv_tick = feed._fetch_deriv_tick
 
 
 def _klines(n, start_ms=1_700_000_000_000, step_ms=3_600_000):
@@ -31,6 +32,10 @@ def _clean_cache(monkeypatch):
     monkeypatch.setattr(
         feed, "_fetch_deriv",
         lambda *args, **kwargs: (_ for _ in ()).throw(FeedError("Deriv hors ligne")),
+    )
+    monkeypatch.setattr(
+        feed, "_fetch_deriv_tick",
+        lambda *args, **kwargs: (_ for _ in ()).throw(FeedError("tick Deriv hors ligne")),
     )
     yield
     feed.clear_cache()
@@ -76,6 +81,7 @@ def test_prix_fonctionne_avec_peu_de_bougies(monkeypatch):
     info = feed.fetch_price("crypto", "BTC/USDT")
     assert info["price"] > 0 and info["span"] == "sur 24h"
     assert info["change_pct"] is not None
+    assert info["live"] is False
 
 
 def test_coupure_reseau_devient_feederror(monkeypatch):
@@ -156,6 +162,15 @@ def test_deriv_symbol_lookup_reste_exact():
     assert feed._resolve_deriv_symbol("crypto", "BTC/USDT", symbols) is None
 
 
+def test_deriv_resout_les_symboles_otc_et_matieres_premieres():
+    symbols = [
+        {"symbol": "frxEURUSD", "display_name": "EUR/USD"},
+        {"symbol": "frxXAGUSD", "display_name": "Silver/USD"},
+    ]
+    assert feed._resolve_deriv_symbol("otc", "EUR/USD OTC", symbols) == "frxEURUSD"
+    assert feed._resolve_deriv_symbol("commodities", "XAG/USD", symbols) == "frxXAGUSD"
+
+
 def test_deriv_demande_des_bougies_avec_le_symbole_resolu(monkeypatch):
     candles = [
         {"epoch": 1_700_000_000 + i * 3600, "open": 100, "high": 101,
@@ -191,3 +206,48 @@ def test_deriv_demande_des_bougies_avec_le_symbole_resolu(monkeypatch):
     assert sent["ticks_history"] == "cryBTCUSD"
     assert sent["style"] == "candles"
     assert sent["granularity"] == 3600
+
+
+def test_deriv_tick_est_la_cotation_temps_reel(monkeypatch):
+    monkeypatch.setattr(feed, "_get_deriv_symbols", lambda: (
+        {"symbol": "cryBTCUSD", "display_name": "BTC/USD"},
+    ))
+    monkeypatch.setattr(feed, "_fetch_deriv_tick", _fetch_deriv_tick)
+    sent = {}
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def send(self, payload):
+            sent.update(json.loads(payload))
+
+        def recv(self, timeout):
+            return json.dumps({"tick": {"quote": "123.45", "epoch": 1_700_000_000}})
+
+    monkeypatch.setattr(feed.websockets.sync.client, "connect",
+                        lambda *a, **k: _Connection())
+
+    tick = feed._fetch_deriv_tick("crypto", "BTC/USDT")
+
+    assert tick["price"] == 123.45
+    assert sent == {"ticks": "cryBTCUSD"}
+
+
+def test_prix_utilise_le_tick_deriv_et_marque_le_live(monkeypatch):
+    hourly = pd.DataFrame({
+        "time": pd.date_range("2025-01-01", periods=48, freq="1h", tz="UTC"),
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 5.0,
+    })
+    monkeypatch.setattr(feed, "fetch_candles", lambda *a, **k: (hourly, "Deriv"))
+    monkeypatch.setattr(feed, "_fetch_deriv_tick", lambda *a, **k: {"price": 102.0})
+
+    info = feed.fetch_price("crypto", "BTC/USDT")
+
+    assert info["price"] == 102.0
+    assert info["source"] == "Deriv"
+    assert info["live"] is True
+    assert info["change_pct"] == pytest.approx(2.0)
