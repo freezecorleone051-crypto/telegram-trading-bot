@@ -1,422 +1,410 @@
+"""Market data providers and candle handling.
+
+Deriv is queried first for instruments it actually lists. Binance is the
+crypto fallback and Yahoo Finance covers other markets and provider outages.
 """
-Récupération des chandeliers (bougies) avec cache TTL et système de secours.
-
-- crypto  -> API publique Binance (aucune clé, gratuit), secours Yahoo Finance
-- forex, actions, ETF, indices, matières premières -> Yahoo Finance (yfinance)
-- otc     -> même actif réel (Binance pour la crypto, Yahoo sinon)
-
-Toutes les fonctions renvoient un DataFrame pandas avec les colonnes :
-time (tz-aware, heure locale), open, high, low, close, volume
-
-Règles de sécurité appliquées ici (et pas ailleurs) :
-- la bougie EN COURS DE FORMATION est supprimée : le moteur ne travaille que
-  sur des bougies FERMÉES, sinon un signal peut apparaître puis disparaître
-  avant la clôture (« repaint ») ;
-- toute erreur réseau / API est convertie en FeedError (jamais d'exception
-  brute qui planterait un scan) ;
-- les données périmées (marché fermé) sont repérables via `staleness()`.
-"""
+import json
 import logging
 import threading
-import time as _time
+import time
+
 import pandas as pd
 import requests
+import websockets.sync.client
+import yfinance as yf
 
 from config import settings
 from data import markets
 
 log = logging.getLogger("tradingbot.feed")
 
-# Plusieurs points d'accès Binance : le premier qui répond est mémorisé.
-# (api.binance.com est bloqué dans certains pays ; data-api.binance.vision est
-# le point d'accès public « données de marché » de Binance.)
-BINANCE_HOSTS = ["https://api.binance.com", "https://data-api.binance.vision",
-                 "https://api1.binance.com", "https://api2.binance.com"]
-BINANCE_PATH = "/api/v3/klines"
-REQUEST_TIMEOUT = 10
-MIN_BARS = 60          # minimum de bougies fermées pour analyser (EMA50, ADX...)
-MAX_BARS = 250         # fenêtre analysée par défaut
+MIN_BARS = 40
+MAX_BARS = 500
+BINANCE_HOSTS = (
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+)
+DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id={app_id}"
+DERIV_SYMBOL_TTL = 3600
 
-_preferred_host = 0
-_yf_lock = threading.Lock()   # yfinance n'est pas sûr en multi-thread
-
-
-class FeedError(Exception):
-    """Levée quand aucune source ne répond avec assez de données."""
-
-
-# ------------------------------------------------------------------
-# Cache mémoire simple (TTL court, évite de marteler les API
-# quand le scan + l'analyse MTF tapent les mêmes actifs)
-# ------------------------------------------------------------------
-_cache: dict = {}
+_cache = {}
 _cache_lock = threading.Lock()
+_deriv_symbols_cache = (0.0, ())
+_deriv_symbols_lock = threading.Lock()
 
 
-def _cache_get(key):
+class FeedError(RuntimeError):
+    """Raised when no provider can return enough valid candles."""
+
+
+def clear_cache(market=None, asset=None):
+    """Clear all cached candles, or just those belonging to one asset."""
     with _cache_lock:
-        item = _cache.get(key)
-        if item and _time.time() - item[0] < settings.FEED_CACHE_TTL:
-            return item[1].copy(), item[2]
-    return None
+        if market is None or asset is None:
+            _cache.clear()
+            return
+        for key in list(_cache):
+            if key[0] == market and key[1] == asset:
+                del _cache[key]
 
 
-def _cache_put(key, df, label):
-    with _cache_lock:
-        _cache[key] = (_time.time(), df.copy(), label)
-        if len(_cache) > 400:      # garde-fou mémoire
-            oldest = sorted(_cache.items(), key=lambda kv: kv[1][0])[:100]
-            for k, _ in oldest:
-                _cache.pop(k, None)
+def _normalise_frame(frame):
+    if frame is None or frame.empty:
+        raise FeedError("aucune bougie reçue")
+
+    frame = frame.copy()
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = [column[0] for column in frame.columns]
+    frame.columns = [str(column).strip().lower() for column in frame.columns]
+
+    if "time" not in frame.columns:
+        frame = frame.reset_index()
+        frame.columns = [str(column).strip().lower() for column in frame.columns]
+        if "datetime" in frame.columns:
+            frame = frame.rename(columns={"datetime": "time"})
+        elif "date" in frame.columns:
+            frame = frame.rename(columns={"date": "time"})
+        elif "index" in frame.columns:
+            frame = frame.rename(columns={"index": "time"})
+
+    required = ("time", "open", "high", "low", "close")
+    if any(column not in frame.columns for column in required):
+        raise FeedError("format de bougies invalide")
+    if "volume" not in frame.columns:
+        frame["volume"] = 0.0
+
+    frame = frame.loc[:, ["time", "open", "high", "low", "close", "volume"]]
+    frame["time"] = pd.to_datetime(frame["time"], utc=True, errors="coerce")
+    for column in ("open", "high", "low", "close", "volume"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["time", "open", "high", "low", "close"])
+    frame = frame.sort_values("time").drop_duplicates("time", keep="last")
+    return frame.reset_index(drop=True)
 
 
-def clear_cache():
-    with _cache_lock:
-        _cache.clear()
+def _binance_interval(timeframe):
+    return {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h",
+            "4h": "4h", "1d": "1d", "1w": "1w"}[timeframe]
 
 
-# ------------------------------------------------------------------
-# Binance (crypto + OTC crypto)
-# ------------------------------------------------------------------
-def _binance_request(params: dict) -> list:
-    """GET /klines avec bascule automatique d'un point d'accès à l'autre."""
-    global _preferred_host
+def _fetch_binance(market, asset, timeframe, limit):
+    item = markets.get_asset(market, asset)
+    symbol = item.binance if item else None
+    if market == "otc":
+        route = markets.OTC_ROUTE.get(asset)
+        symbol = route[1] if route and route[0] == "binance" else None
+    if not symbol:
+        raise FeedError("actif non disponible chez Binance")
+
     errors = []
-    n = len(BINANCE_HOSTS)
-    for k in range(n):
-        idx = (_preferred_host + k) % n
-        host = BINANCE_HOSTS[idx]
+    for host in BINANCE_HOSTS:
         try:
-            r = requests.get(host + BINANCE_PATH, params=params,
-                             timeout=REQUEST_TIMEOUT,
-                             headers={"User-Agent": "Mozilla/5.0"})
-        except requests.exceptions.RequestException as e:
-            errors.append(f"{host.split('//')[1]} : {type(e).__name__}")
+            response = requests.get(
+                f"{host}/api/v3/klines",
+                params={"symbol": symbol, "interval": _binance_interval(timeframe),
+                        "limit": min(max(int(limit), MIN_BARS), 1000)},
+                timeout=(3, 8),
+            )
+            if response.status_code != 200:
+                errors.append(f"{host}: HTTP {response.status_code}")
+                continue
+            rows = response.json()
+            if not isinstance(rows, list) or not rows:
+                errors.append(f"{host}: réponse sans bougies")
+                continue
+            frame = pd.DataFrame(
+                [[row[0], row[1], row[2], row[3], row[4], row[5]]
+                 for row in rows],
+                columns=["time", "open", "high", "low", "close", "volume"],
+            )
+            frame["time"] = pd.to_datetime(frame["time"], unit="ms", utc=True)
+            return _normalise_frame(frame), "Binance"
+        except (requests.RequestException, ValueError, TypeError, IndexError) as exc:
+            errors.append(f"{host}: {type(exc).__name__}")
+    raise FeedError("Binance indisponible (" + "; ".join(errors) + ")")
+
+
+def _deriv_request(connection, payload):
+    connection.send(json.dumps(payload))
+    response = json.loads(connection.recv(timeout=8))
+    if "error" in response:
+        raise FeedError(response["error"].get("message", "erreur API Deriv"))
+    return response
+
+
+def _get_deriv_symbols():
+    global _deriv_symbols_cache
+    now = time.monotonic()
+    with _deriv_symbols_lock:
+        cached_at, symbols = _deriv_symbols_cache
+        if symbols and now - cached_at < DERIV_SYMBOL_TTL:
+            return symbols
+
+    with websockets.sync.client.connect(
+            DERIV_WS_URL.format(app_id=settings.DERIV_APP_ID),
+            open_timeout=5, close_timeout=2, max_size=2**20) as connection:
+        response = _deriv_request(connection, {"active_symbols": "brief"})
+    symbols = response.get("active_symbols")
+    if not isinstance(symbols, list):
+        raise FeedError("réponse active_symbols invalide")
+    with _deriv_symbols_lock:
+        _deriv_symbols_cache = (time.monotonic(), tuple(symbols))
+    return tuple(symbols)
+
+
+def _resolve_deriv_symbol(market, asset, symbols):
+    item = markets.get_asset(market, asset)
+    if item is None:
+        return None
+
+    display_names = {
+        _symbol_key(value) for value in (item.name, item.label, *item.aliases)
+        if value
+    }
+    compact_pair = _symbol_key(item.name)
+    crypto_base = (item.binance[:-4] if item.binance and
+                   item.binance.endswith("USDT") else None)
+    crypto_pair = _symbol_key(f"{crypto_base}USD") if crypto_base else None
+
+    exact_display = []
+    exact_symbol = []
+    for row in symbols:
+        symbol = str(row.get("symbol", ""))
+        display = str(row.get("display_name", ""))
+        if _symbol_key(display) in display_names:
+            exact_display.append(symbol)
             continue
-        if r.status_code in (418, 429):
-            # limite de débit / ban IP : inutile d'insister sur un autre hôte
-            raise FeedError(f"Binance limite de débit (HTTP {r.status_code})")
-        if r.status_code != 200:
-            errors.append(f"{host.split('//')[1]} : HTTP {r.status_code}")
-            continue
+        normalized_symbol = _symbol_key(symbol)
+        if (compact_pair and normalized_symbol.endswith(compact_pair)
+                and market in ("forex", "otc")):
+            exact_symbol.append(symbol)
+        elif crypto_pair and normalized_symbol.endswith(crypto_pair):
+            exact_symbol.append(symbol)
+        elif normalized_symbol in display_names:
+            exact_symbol.append(symbol)
+
+    matches = exact_display or exact_symbol
+    unique = list(dict.fromkeys(symbol for symbol in matches if symbol))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _symbol_key(value):
+    return "".join(character for character in str(value).upper()
+                   if character.isalnum())
+
+
+def _fetch_deriv(market, asset, timeframe, limit):
+    if not settings.DERIV_APP_ID:
+        raise FeedError("DERIV_APP_ID n'est pas configuré")
+    granularity = markets.TF_SECONDS[timeframe]
+    if timeframe == "1w":
+        granularity = 86400
+
+    symbols = _get_deriv_symbols()
+    symbol = _resolve_deriv_symbol(market, asset, symbols)
+    if not symbol:
+        raise FeedError(f"{asset} n'est pas disponible chez Deriv")
+
+    with websockets.sync.client.connect(
+            DERIV_WS_URL.format(app_id=settings.DERIV_APP_ID),
+            open_timeout=5, close_timeout=2, max_size=2**20) as connection:
+        response = _deriv_request(connection, {
+            "ticks_history": symbol,
+            "end": "latest",
+            "count": min(max(int(limit), MIN_BARS), 5000),
+            "style": "candles",
+            "granularity": granularity,
+        })
+
+    candles = response.get("candles")
+    if not isinstance(candles, list) or not candles:
+        raise FeedError("Deriv n'a renvoyé aucune bougie")
+    frame = _normalise_frame(pd.DataFrame(candles).rename(columns={"epoch": "time"}))
+    if timeframe == "1w":
+        frame = _resample(frame, "1w")
+    return frame, "Deriv"
+
+
+def _resample(frame, timeframe):
+    rule = {"4h": "4h", "1w": "W-SUN"}[timeframe]
+    indexed = frame.set_index("time")
+    grouped = indexed.resample(rule, label="left", closed="left")
+    result = grouped.agg({
+        "open": "first", "high": "max", "low": "min",
+        "close": "last", "volume": "sum",
+    }).dropna(subset=["open", "high", "low", "close"])
+    result.index.name = "time"
+    return _normalise_frame(result.reset_index())
+
+
+def fetch_yfinance(market, asset, timeframe, limit=MAX_BARS):
+    item = markets.get_asset(market, asset)
+    symbols = []
+    if market == "otc":
+        route = markets.OTC_ROUTE.get(asset)
+        if route and route[0] == "yfinance":
+            symbols.append(route[1])
+    elif item and item.yf:
+        symbols.append(item.yf)
+    if item:
+        symbols.extend(item.yf_fallbacks)
+    if market == "crypto":
+        fallback = markets.CRYPTO_YF_FALLBACK.get(asset)
+        if fallback:
+            symbols.append(fallback)
+    symbols = list(dict.fromkeys(symbols))
+    if not symbols:
+        raise FeedError("aucun symbole Yahoo Finance pour cet actif")
+
+    interval, period = markets.YF_INTERVAL_MAP[timeframe]
+    if timeframe == "4h":
+        interval = "1h"
+
+    errors = []
+    for symbol in symbols:
         try:
-            rows = r.json()
-        except ValueError:
-            errors.append(f"{host.split('//')[1]} : réponse illisible")
-            continue
-        _preferred_host = idx
-        return rows
-    raise FeedError("Binance injoignable (" + " ; ".join(errors) + ")")
+            frame = yf.download(
+                symbol, period=period, interval=interval, progress=False,
+                auto_adjust=False, threads=False, timeout=10,
+            )
+            if frame is None or frame.empty:
+                errors.append(f"{symbol}: aucune donnée")
+                continue
+            if isinstance(frame.columns, pd.MultiIndex):
+                frame.columns = frame.columns.get_level_values(0)
+            frame = frame.rename(columns={
+                "Open": "open", "High": "high", "Low": "low",
+                "Close": "close", "Volume": "volume",
+            })
+            frame.index.name = "time"
+            frame = _normalise_frame(frame.reset_index())
+            if timeframe == "4h":
+                frame = _resample(frame, "4h")
+            return frame.tail(limit), f"Yahoo Finance ({symbol})"
+        except Exception as exc:
+            errors.append(f"{symbol}: {type(exc).__name__}")
+    raise FeedError("Yahoo Finance indisponible (" + "; ".join(errors) + ")")
 
 
-def _binance_df(rows: list) -> pd.DataFrame:
-    df = pd.DataFrame(rows, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "qav", "ntrades", "tbb", "tbq", "ignore"])
-    for col in ("open", "high", "low", "close", "volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    return df[["time", "open", "high", "low", "close", "volume"]]
+def _provider_chain(market, asset, timeframe, limit):
+    providers = [_fetch_deriv]
+    if market == "crypto" or (market == "otc" and
+                              markets.OTC_ROUTE.get(asset, (None,))[0] == "binance"):
+        providers.append(_fetch_binance)
+    providers.append(fetch_yfinance)
 
-
-def fetch_binance(symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
-    rows = _binance_request({"symbol": symbol, "interval": interval,
-                             "limit": min(max(limit, 2), 1000)})
-    if not rows:
-        raise FeedError("Binance : réponse vide")
-    return _binance_df(rows)
-
-
-def fetch_binance_history(symbol: str, interval: str, bars: int) -> pd.DataFrame:
-    """Historique long (backtest) : remonte dans le temps par blocs de 1000."""
-    frames, end = [], None
-    remaining = bars
-    while remaining > 0:
-        params = {"symbol": symbol, "interval": interval,
-                  "limit": min(1000, remaining)}
-        if end is not None:
-            params["endTime"] = end
-        rows = _binance_request(params)
-        if not rows:
-            break
-        df = _binance_df(rows)
-        frames.append(df)
-        remaining -= len(df)
-        end = int(rows[0][0]) - 1
-        if len(rows) < params["limit"]:
-            break
-    if not frames:
-        raise FeedError("Binance : aucun historique")
-    return pd.concat(frames).drop_duplicates("time").sort_values("time")
-
-
-# ------------------------------------------------------------------
-# Yahoo Finance (forex, actions, ETF, indices, matières premières)
-# ------------------------------------------------------------------
-def fetch_yfinance(symbol: str, interval: str, limit: int = 250,
-                   period: str | None = None,
-                   naive_tz: str = "UTC") -> pd.DataFrame:
-    try:
-        import yfinance as yf  # import paresseux pour démarrer plus vite
-    except ImportError as e:  # pragma: no cover
-        raise FeedError("yfinance n'est pas installé (pip install yfinance)") from e
-
-    yf_interval, default_period = markets.YF_INTERVAL_MAP.get(interval, ("5m", "1mo"))
-    period = period or default_period
-    df = None
-    last_err = None
-    for attempt in range(2):          # 1 nouvel essai en cas d'erreur passagère
+    errors = []
+    for provider in providers:
         try:
-            with _yf_lock:
-                df = yf.Ticker(symbol).history(interval=yf_interval, period=period,
-                                               auto_adjust=False, prepost=False)
-            if df is not None and not df.empty:
-                break
-        except Exception as e:  # yfinance lève des erreurs très variées
-            last_err = e
-        _time.sleep(0.6)
-    if df is None or df.empty:
-        detail = f" ({type(last_err).__name__})" if last_err else ""
-        raise FeedError(f"Yahoo : aucune donnée pour {symbol}{detail}")
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df.reset_index()
-    rename = {}
-    for col in df.columns:
-        low = str(col).lower()
-        if low.startswith("date") or low == "index":
-            rename[col] = "time"
-        elif low in ("open", "high", "low", "close"):
-            rename[col] = low
-        elif low in ("volume", "vol"):
-            rename[col] = "volume"
-    df = df.rename(columns=rename)
-
-    needed = {"time", "open", "high", "low", "close"}
-    if not needed.issubset(df.columns):
-        raise FeedError(f"Yahoo : colonnes inattendues {list(df.columns)}")
-    if "volume" not in df.columns:
-        df["volume"] = 0.0
-
-    t = pd.to_datetime(df["time"], errors="coerce")
-    if t.dt.tz is None:     # anciennes versions : dates sans fuseau
-        t = t.dt.tz_localize(naive_tz, ambiguous="NaT", nonexistent="NaT")
-    df["time"] = t.dt.tz_convert("UTC")
-    for col in ("open", "high", "low", "close", "volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["time", "open", "high", "low", "close"])
-
-    # Timeframe 4h : recalculée à partir des bougies 1h (UTC)
-    if interval == "4h":
-        df = df.set_index("time").resample("4h", label="left", closed="left").agg(
-            {"open": "first", "high": "max", "low": "min",
-             "close": "last", "volume": "sum"}).dropna(
-            subset=["open", "close"]).reset_index()
-
-    return df[["time", "open", "high", "low", "close", "volume"]].sort_values(
-        "time").reset_index(drop=True)
+            result = provider(market, asset, timeframe, limit)
+            if isinstance(result, tuple) and len(result) == 2:
+                frame, source = result
+            else:
+                frame, source = result, "Yahoo Finance"
+            frame = drop_forming(frame, timeframe, _session_for(market, asset))
+            if len(frame) < MIN_BARS:
+                raise FeedError(f"{len(frame)} bougies valides, {MIN_BARS} requises")
+            return frame.tail(limit).reset_index(drop=True), source
+        except FeedError as exc:
+            errors.append(f"{provider.__name__}: {exc}")
+        except Exception as exc:
+            log.warning("Source de cours %s en erreur pour %s: %s",
+                        provider.__name__, asset, exc)
+            errors.append(f"{provider.__name__}: {type(exc).__name__}")
+    raise FeedError("Aucune source disponible. " + " | ".join(errors))
 
 
-# ------------------------------------------------------------------
-# Bougies fermées, fraîcheur des données
-# ------------------------------------------------------------------
-def tf_seconds(tf: str) -> int:
-    return markets.TF_SECONDS.get(tf, 300)
-
-
-def _is_complete(open_ts: pd.Timestamp, tf: str, now: pd.Timestamp,
-                 session: str | None) -> bool:
-    """Une bougie est complète quand son intervalle est écoulé."""
-    if tf == "1d" and session in markets.SESSIONS:
-        tz, hh, mm = markets.SESSIONS[session]
-        lo, ln = open_ts.tz_convert(tz), now.tz_convert(tz)
-        if ln.date() > lo.date():
-            return True
-        if ln.date() == lo.date():
-            return ln.hour * 60 + ln.minute >= hh * 60 + mm
-        return False
-    return open_ts + pd.Timedelta(seconds=tf_seconds(tf)) <= now
-
-
-def drop_forming(df: pd.DataFrame, tf: str, session: str | None = None,
-                 now: pd.Timestamp | None = None) -> pd.DataFrame:
-    """Retire la dernière bougie si elle n'est pas encore fermée."""
-    if df.empty:
-        return df
-    now = now if now is not None else pd.Timestamp.now(tz="UTC")
-    last_open = pd.Timestamp(df["time"].iloc[-1])
-    if last_open.tzinfo is None:
-        last_open = last_open.tz_localize("UTC")
-    if _is_complete(last_open, tf, now, session):
-        return df
-    return df.iloc[:-1].reset_index(drop=True)
-
-
-def staleness(df: pd.DataFrame, tf: str, now: pd.Timestamp | None = None) -> dict:
-    """Fraîcheur des données : age en secondes depuis la fermeture de la
-    dernière bougie, et `stale` = True si le marché semble fermé / le flux gelé."""
-    now = now if now is not None else pd.Timestamp.now(tz="UTC")
-    last_open = pd.Timestamp(df["time"].iloc[-1])
-    if last_open.tzinfo is None:
-        last_open = last_open.tz_localize("UTC")
-    last_close = last_open + pd.Timedelta(seconds=tf_seconds(tf))
-    age = max((now - last_close).total_seconds(), 0.0)
-    if tf == "1d":
-        limit = 4.5 * 86400       # week-end + jour férié
-    elif tf == "1w":
-        limit = 10 * 86400
-    else:
-        limit = max(3 * tf_seconds(tf), 600)
-    return {"age_s": age, "stale": age > limit, "last_close": last_close}
-
-
-def _clean(df: pd.DataFrame) -> pd.DataFrame:
-    """Nettoyage : doublons, prix aberrants, cohérence high/low."""
-    df = df.drop_duplicates("time").sort_values("time")
-    df = df[(df["close"] > 0) & (df["open"] > 0) & (df["high"] > 0) & (df["low"] > 0)]
-    df = df.copy()
-    df["high"] = df[["high", "open", "close"]].max(axis=1)
-    df["low"] = df[["low", "open", "close"]].min(axis=1)
-    df["volume"] = df["volume"].fillna(0.0)
-    return df.reset_index(drop=True)
-
-
-def _finalize(df: pd.DataFrame, tf: str, asset: "markets.Asset", limit: int,
-              closed_only: bool, min_bars: int) -> pd.DataFrame:
-    df = _clean(df)
-    if closed_only:
-        df = drop_forming(df, tf, asset.session)
-    df = df.tail(limit).reset_index(drop=True)
-    if len(df) < min_bars:
-        raise FeedError(f"Pas assez de bougies ({len(df)} < {min_bars}) pour {asset.name} {tf}")
-    df["time"] = df["time"].dt.tz_convert(settings.TZ_NAME)
-    return df
-
-
-# ------------------------------------------------------------------
-# Routage principal
-# ------------------------------------------------------------------
-def _plan(a: "markets.Asset") -> list:
-    """Liste ordonnée des sources à essayer : (type, symbole, libellé)."""
-    plan = []
-    suffix = " — même actif que l'OTC" if a.market == "otc" else ""
-    if a.binance:
-        plan.append(("binance", a.binance, f"Binance ({a.binance}){suffix}"))
-    if a.yf:
-        tag = ", secours" if a.binance else ""
-        plan.append(("yf", a.yf, f"Yahoo Finance ({a.yf}{tag}){suffix}"))
-    for sym in a.yf_fallbacks:
-        plan.append(("yf", sym, f"Yahoo Finance ({sym}, secours){suffix}"))
-    return plan
-
-
-def fetch_candles(market: str, asset: str, timeframe: str, limit: int = MAX_BARS,
-                  closed_only: bool = True, min_bars: int | None = None):
-    """
-    Renvoie (dataframe, source_label), avec cache court.
-    market : 'crypto' | 'forex' | 'stocks' | 'etf' | 'indices' | 'commodities' | 'otc'
-    asset  : ex. 'BTC/USDT', 'EUR/USD', 'NVDA', 'US500', 'COPPER'
-    timeframe : '1m' '5m' '15m' '1h' '4h' '1d' '1w'
-    closed_only : True (défaut) = uniquement des bougies fermées (analyse).
-                  False = garde la bougie en cours (pour afficher un prix live).
-    """
-    timeframe = timeframe.lower()
-    if timeframe not in markets.TIMEFRAMES:
-        raise FeedError(f"Timeframe inconnu : {timeframe}")
-    a = markets.get_asset(market, asset)
-    if a is None:
-        raise FeedError(f"Actif inconnu : {market}/{asset}")
+def fetch_candles(market, asset, timeframe, limit=MAX_BARS):
+    """Return (closed OHLCV candles, provider name) using provider failover."""
+    if market not in markets.CATALOG or asset not in markets.assets_for(market):
+        raise FeedError(f"actif inconnu : {market}/{asset}")
     if timeframe not in markets.fetchable_timeframes(market):
-        raise FeedError(f"Timeframe {timeframe} non disponible pour {asset} "
-                        f"(disponibles : {', '.join(markets.timeframes_for(market))})")
-    if min_bars is None:
-        min_bars = MIN_BARS if closed_only else 2
-    limit = max(int(limit), min_bars)
+        raise FeedError(f"timeframe {timeframe} non disponible pour {market}")
+    limit = max(MIN_BARS, min(int(limit), MAX_BARS))
+    key = (market, asset, timeframe, limit)
+    now = time.monotonic()
+    with _cache_lock:
+        cached = _cache.get(key)
+        if cached and now - cached[0] < settings.FEED_CACHE_TTL:
+            return cached[1].copy(), cached[2]
 
-    key = (market, asset, timeframe, limit, closed_only, min_bars)
-    hit = _cache_get(key)
-    if hit is not None:
-        return hit
-
-    naive_tz = markets.SESSIONS[a.session][0] if a.session in markets.SESSIONS else "UTC"
-    errors = []
-    for kind, sym, label in _plan(a):
-        try:
-            if kind == "binance":
-                raw = fetch_binance(sym, timeframe, limit + 1)
-            else:
-                raw = fetch_yfinance(sym, timeframe, limit + 1, naive_tz=naive_tz)
-            result = (_finalize(raw, timeframe, a, limit, closed_only, min_bars), label)
-            _cache_put(key, *result)
-            return result[0].copy(), result[1]
-        except FeedError as e:
-            errors.append(f"{sym} : {e}")
-        except Exception as e:     # filet de sécurité : jamais d'exception brute
-            log.exception("Erreur inattendue (%s %s)", sym, timeframe)
-            errors.append(f"{sym} : {type(e).__name__}")
-    raise FeedError(" / ".join(errors) if errors else f"Aucune source pour {asset}")
+    frame, source = _provider_chain(market, asset, timeframe, limit)
+    with _cache_lock:
+        _cache[key] = (time.monotonic(), frame.copy(), source)
+    return frame.copy(), source
 
 
-def fetch_history(market: str, asset: str, timeframe: str, bars: int = 2000):
-    """Historique long pour le backtest. Renvoie (df de bougies fermées, source)."""
-    timeframe = timeframe.lower()
-    a = markets.get_asset(market, asset)
-    if a is None:
-        raise FeedError(f"Actif inconnu : {market}/{asset}")
-    errors = []
-    for kind, sym, label in _plan(a):
-        try:
-            if kind == "binance":
-                raw = fetch_binance_history(sym, timeframe, bars + 1)
-            else:
-                naive_tz = (markets.SESSIONS[a.session][0]
-                            if a.session in markets.SESSIONS else "UTC")
-                raw = fetch_yfinance(sym, timeframe, bars + 1,
-                                     period=markets.YF_MAX_PERIOD.get(timeframe),
-                                     naive_tz=naive_tz)
-            return _finalize(raw, timeframe, a, bars, True, MIN_BARS), label
-        except FeedError as e:
-            errors.append(f"{sym} : {e}")
-    raise FeedError(" / ".join(errors))
+def fetch_history(market, asset, timeframe, bars):
+    return fetch_candles(market, asset, timeframe, bars)
 
 
-# ------------------------------------------------------------------
-# Prix en direct (/prix)
-# ------------------------------------------------------------------
-def fetch_price(market: str, asset: str) -> dict:
-    """Prix courant + variation. Marchés à séances : variation sur la séance
-    (clôture précédente) ; autres marchés : variation sur 24 h glissantes."""
-    if market in markets.SESSION_MARKETS:
-        df, label = fetch_candles(market, asset, "1d", 10, closed_only=False, min_bars=2)
-        price = float(df["close"].iloc[-1])
-        ref = float(df["close"].iloc[-2])
-        span = "sur la séance"
+def fetch_price(market, asset):
+    frame, source = fetch_candles(market, asset, "1h", 48)
+    close = frame["close"].astype(float)
+    if len(close) < 2:
+        raise FeedError(f"pas assez de cours pour {asset}")
+    current = float(close.iloc[-1])
+    previous = float(close.iloc[max(0, len(close) - 25)])
+    change_pct = ((current / previous) - 1) * 100 if previous else 0.0
+    return {"price": current, "change_pct": change_pct,
+            "span": "sur 24h", "source": source}
+
+
+def _session_for(market, asset):
+    item = markets.get_asset(market, asset)
+    return item.session if item and item.session else None
+
+
+def drop_forming(frame, timeframe, session=None, now=None):
+    """Remove a candle whose close boundary has not yet passed."""
+    if frame.empty:
+        return frame.copy()
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
     else:
-        df, label = fetch_candles(market, asset, "1h", 60, closed_only=False, min_bars=2)
-        price = float(df["close"].iloc[-1])
-        target = df["time"].iloc[-1] - pd.Timedelta(hours=24)
-        older = df[df["time"] <= target]
-        ref = float(older["close"].iloc[-1]) if not older.empty else None
-        span = "sur 24h"
-    change = (price - ref) / ref * 100 if ref else None
-    return {"price": price, "change_pct": change, "span": span, "source": label,
-            "time": df["time"].iloc[-1]}
+        now = now.tz_convert("UTC")
+    result = frame.copy()
+    last_time = pd.Timestamp(result["time"].iloc[-1])
+    if last_time.tzinfo is None:
+        last_time = last_time.tz_localize("UTC")
+    else:
+        last_time = last_time.tz_convert("UTC")
+
+    if timeframe == "1d" and session in markets.SESSIONS:
+        timezone, close_hour, close_minute = markets.SESSIONS[session]
+        local_now = now.tz_convert(timezone)
+        local_candle_date = last_time.tz_convert(timezone).date()
+        if (local_candle_date == local_now.date()
+                or last_time.date() == local_now.date()):
+            close_time = local_now.replace(
+                hour=close_hour, minute=close_minute, second=0, microsecond=0)
+            if local_now < close_time:
+                return result.iloc[:-1].reset_index(drop=True)
+        return result.reset_index(drop=True)
+
+    seconds = markets.TF_SECONDS.get(timeframe)
+    if seconds and last_time + pd.Timedelta(seconds=seconds) > now:
+        return result.iloc[:-1].reset_index(drop=True)
+    return result.reset_index(drop=True)
 
 
-if __name__ == "__main__":
-    # Test manuel : python -m data.feed
-    t0 = _time.time()
-    for mkt, name, tf in [("crypto", "BTC/USDT", "5m"),
-                          ("forex", "EUR/USD", "15m"),
-                          ("stocks", "NVDA", "1h"),
-                          ("indices", "US500", "1d")]:
-        try:
-            data, src = fetch_candles(mkt, name, tf)
-            st = staleness(data, tf)
-            print(f"[OK] {mkt:11s} {name:10s} {tf:3s} -> {len(data)} bougies "
-                  f"({src}) en {_time.time()-t0:.1f}s "
-                  f"| dernière bougie fermée {data['time'].iloc[-1]} "
-                  f"{'(MARCHÉ FERMÉ ?)' if st['stale'] else ''}")
-        except FeedError as err:
-            print(f"[ERREUR] {mkt} {name} {tf} -> {err}")
+def staleness(frame, timeframe, now=None):
+    """Report candle age and whether it is stale relative to its timeframe."""
+    if frame.empty:
+        return {"stale": True, "age_s": None}
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    else:
+        now = now.tz_convert("UTC")
+    last_time = pd.Timestamp(frame["time"].iloc[-1])
+    if last_time.tzinfo is None:
+        last_time = last_time.tz_localize("UTC")
+    else:
+        last_time = last_time.tz_convert("UTC")
+    age = max(0.0, (now - last_time).total_seconds())
+    allowed_age = markets.TF_SECONDS.get(timeframe, 86400) * 2.5
+    return {"stale": age > allowed_age, "age_s": age}

@@ -19,7 +19,7 @@ telegram-trading-bot/
 │   └── settings.py         # toute la configuration (.env + constantes)
 ├── data/
 │   ├── markets.py          # catalogue des marchés, actifs, sources
-│   └── feed.py             # cours Binance/Yahoo + cache TTL + secours
+│   └── feed.py             # Deriv prioritaire, Binance/Yahoo en secours + cache
 ├── core/                   # le cerveau : tout le calcul technique
 │   ├── indicators.py       # EMA, RSI, MACD, ATR, Bollinger, Stochastique
 │   ├── patterns.py         # chandeliers japonais (pin bar, englobante, ...)
@@ -163,16 +163,25 @@ Tu avais raison : deux plateformes qui affichent le **même actif** montrent le
 **même graphique**, car le cours vient du même marché. Le bot ne se connecte
 pas à ton broker :
 
-| Famille | Source | Actifs |
+| Famille | Ordre des sources | Actifs |
 |---|---|---|
-| Crypto | API publique **Binance** (aucune clé) | BTC, ETH, BNB, SOL, XRP, ADA, DOGE (USDT) |
-| Forex & Or | **Yahoo Finance** | EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF, NZD/USD, XAU/USD (or via contrat COMEX) |
-| OTC / binaires | Le **même actif** ailleurs | EUR/USD OTC, GBP/USD OTC, USD/JPY OTC, XAU/USD OTC, BTC/USD OTC, ETH/USD OTC |
+| Toutes les familles | **Deriv** si l'instrument exact est listé, puis source de secours | Forex, crypto et instruments Deriv disponibles |
+| Crypto | **Deriv → Binance → Yahoo Finance** | BTC, ETH, BNB, SOL, XRP, ADA, DOGE (USDT) |
+| Forex, actions, ETF, indices, matières premières | **Deriv → Yahoo Finance** | Actifs du catalogue, uniquement si le symbole Deriv correspond exactement |
+| OTC / binaires | Données de l'actif réel correspondant ; Deriv en priorité s'il est listé | EUR/USD OTC, GBP/USD OTC, USD/JPY OTC, XAU/USD OTC, BTC/USD OTC, ETH/USD OTC |
 
-- Si Binance est indisponible, secours automatique sur Yahoo pour la crypto.
+- Les données de marché publiques Deriv ne nécessitent pas de jeton personnel.
+- Binance et Yahoo Finance sont utilisés automatiquement si Deriv ne propose pas
+  l'actif ou si son flux est indisponible.
 - Le forex ferme le week-end : "aucune donnée" samedi/dimanche est normal.
 - Ton broker peut afficher un écart minuscule (spread) : vérifie l'entrée sur
   ta plateforme avant de trader.
+
+Les analyses manuelles `/analyse` attendent 20 secondes puis recalculent le
+signal sur des cours actualisés. Si la direction change entre les deux passes,
+le bot répond `ATTENDRE`. Ce délai est réglable via
+`ANALYSIS_CONFIRMATION_SECONDS` (0 pour le désactiver) ; il ne garantit pas
+qu'un signal soit rentable.
 
 ---
 
@@ -194,6 +203,8 @@ pas à ton broker :
 | `TZ_NAME` | Africa/Lubumbashi | fuseau affiché |
 | `NB_CANDLES_CHART` | 80 | bougies dessinées sur l'image |
 | `FEED_CACHE_TTL` | 25 | cache des cours (secondes) |
+| `DERIV_APP_ID` | 1089 | ID d'application public utilisé par le WebSocket Deriv |
+| `ANALYSIS_CONFIRMATION_SECONDS` | 20 | délai avant confirmation d'une analyse manuelle |
 
 Pour ajouter des actifs : `data/markets.py` (`CRYPTO_ASSETS`, `FOREX_ASSETS`,
 `OTC_ASSETS`, `OTC_ROUTE`).

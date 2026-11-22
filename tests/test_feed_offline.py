@@ -1,10 +1,14 @@
 """Couche de données testée HORS RÉSEAU (requests / yfinance simulés)."""
+import json
+
 import pandas as pd
 import pytest
 import requests
 
 from data import feed, markets
 from data.feed import FeedError
+
+_fetch_deriv = feed._fetch_deriv
 
 
 def _klines(n, start_ms=1_700_000_000_000, step_ms=3_600_000):
@@ -22,8 +26,12 @@ class _Resp:
 
 
 @pytest.fixture(autouse=True)
-def _clean_cache():
+def _clean_cache(monkeypatch):
     feed.clear_cache()
+    monkeypatch.setattr(
+        feed, "_fetch_deriv",
+        lambda *args, **kwargs: (_ for _ in ()).throw(FeedError("Deriv hors ligne")),
+    )
     yield
     feed.clear_cache()
 
@@ -122,3 +130,64 @@ def test_pas_assez_de_bougies(monkeypatch):
     monkeypatch.setattr(feed, "fetch_yfinance", lambda *a, **k: (_ for _ in ()).throw(FeedError("x")))
     with pytest.raises(FeedError):
         feed.fetch_candles("crypto", "BTC/USDT", "1h")
+
+
+def test_deriv_est_la_premiere_source(monkeypatch):
+    candles = pd.DataFrame({
+        "time": pd.date_range("2025-01-01", periods=100, freq="1h", tz="UTC"),
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 5.0,
+    })
+    monkeypatch.setattr(feed, "_fetch_deriv", lambda *a, **k: (candles, "Deriv"))
+    monkeypatch.setattr(feed, "_fetch_binance", lambda *a, **k: pytest.fail("Binance devait être ignoré"))
+    monkeypatch.setattr(feed, "fetch_yfinance", lambda *a, **k: pytest.fail("Yahoo devait être ignoré"))
+
+    frame, source = feed.fetch_candles("crypto", "BTC/USDT", "1h")
+
+    assert source == "Deriv"
+    assert len(frame) >= feed.MIN_BARS
+
+
+def test_deriv_symbol_lookup_reste_exact():
+    symbols = [
+        {"symbol": "frxEURUSD", "display_name": "EUR/USD"},
+        {"symbol": "frxGBPUSD", "display_name": "GBP/USD"},
+    ]
+    assert feed._resolve_deriv_symbol("forex", "EUR/USD", symbols) == "frxEURUSD"
+    assert feed._resolve_deriv_symbol("crypto", "BTC/USDT", symbols) is None
+
+
+def test_deriv_demande_des_bougies_avec_le_symbole_resolu(monkeypatch):
+    candles = [
+        {"epoch": 1_700_000_000 + i * 3600, "open": 100, "high": 101,
+         "low": 99, "close": 100.5}
+        for i in range(80)
+    ]
+    monkeypatch.setattr(feed, "_get_deriv_symbols", lambda: (
+        {"symbol": "cryBTCUSD", "display_name": "BTC/USD"},
+    ))
+    monkeypatch.setattr(feed, "_fetch_deriv", _fetch_deriv)
+    sent = {}
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def send(self, payload):
+            sent.update(json.loads(payload))
+
+        def recv(self, timeout):
+            return json.dumps({"candles": candles})
+
+    monkeypatch.setattr(feed.websockets.sync.client, "connect",
+                        lambda *a, **k: _Connection())
+
+    frame, source = feed._fetch_deriv("crypto", "BTC/USDT", "1h", 80)
+
+    assert source == "Deriv"
+    assert len(frame) == 80
+    assert sent["ticks_history"] == "cryBTCUSD"
+    assert sent["style"] == "candles"
+    assert sent["granularity"] == 3600

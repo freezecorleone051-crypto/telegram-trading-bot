@@ -143,6 +143,10 @@ TZ_NAME = os.getenv("TZ_NAME", "Africa/Lubumbashi").strip() or "Africa/Lubumbash
 NB_CANDLES_CHART = _num("NB_CANDLES_CHART", 80, int)
 # Durée du cache des cours en secondes (évite de marteler les API).
 FEED_CACHE_TTL = _num("FEED_CACHE_TTL", 25, int)
+# ID public de l'application Deriv (les endpoints de données marché sont publics).
+DERIV_APP_ID = _num("DERIV_APP_ID", 1089, int)
+# Deux analyses séparées dans le temps doivent confirmer le signal avant envoi.
+ANALYSIS_CONFIRMATION_SECONDS = max(0, _num("ANALYSIS_CONFIRMATION_SECONDS", 20, int))
 
 DATA_DIR = PROJECT_ROOT / "data_store"
 LOG_DIR = PROJECT_ROOT / "logs"

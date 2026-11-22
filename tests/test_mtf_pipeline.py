@@ -4,7 +4,7 @@ import pytest
 from config import settings
 from data import feed
 from services import mtf
-from services.analysis import full_analysis
+from services.analysis import full_analysis, reconcile_confirmation
 from synthetic import make_ohlc
 
 
@@ -104,3 +104,15 @@ def test_pipeline_propage_feederror():
         raise feed.FeedError("down")
     with pytest.raises(feed.FeedError):
         full_analysis("crypto", "BTC/USDT", "15m", "always", fetch=fetch)
+
+
+def test_confirmation_conserve_la_direction_stable_et_annule_la_divergence():
+    first = {"signal": {"direction": "ACHAT"}}
+    stable = {"signal": {"direction": "ACHAT", "reasons": []}}
+    changed = {"signal": {"direction": "VENTE", "reasons": []}}
+
+    assert reconcile_confirmation(first, stable, 20) is stable
+    result = reconcile_confirmation(first, changed, 20)
+    assert result["signal"]["direction"] == "ATTENDRE"
+    assert result["signal"]["initial_direction"] == "ACHAT"
+    assert result["signal"]["confirmed_direction"] == "VENTE"

@@ -32,7 +32,7 @@ from data.feed import FeedError
 from outputs import chart, messages
 from services import backtest as backtest_service
 from services import scanner
-from services.analysis import full_analysis
+from services.analysis import full_analysis, reconcile_confirmation
 from storage import history
 from utils.logger import setup_logging
 
@@ -83,7 +83,14 @@ def _parse_asset_tf(tokens: list):
 # ==================================================================
 async def run_full_analysis(market: str, asset: str, timeframe: str):
     """Chaîne complète. Renvoie (png, texte, légende) ou lève FeedError."""
-    res = await asyncio.to_thread(full_analysis, market, asset, timeframe, "always")
+    first = await asyncio.to_thread(full_analysis, market, asset, timeframe, "always")
+    res = first
+    confirmation_seconds = settings.ANALYSIS_CONFIRMATION_SECONDS
+    if confirmation_seconds:
+        await asyncio.sleep(confirmation_seconds)
+        feed.clear_cache(market, asset)
+        res = await asyncio.to_thread(full_analysis, market, asset, timeframe, "always")
+        res = reconcile_confirmation(first, res, confirmation_seconds)
     signal = res["signal"]
     a = markets.get_asset(market, asset)
     png = await asyncio.to_thread(
@@ -113,7 +120,7 @@ async def send_analysis(context: ContextTypes.DEFAULT_TYPE, chat_id: int, market
     status = await context.bot.send_message(
         chat_id=chat_id,
         text=f"Analyse de {asset} en {timeframe}… (cours, régime, 8 modules, contrôle "
-             "multi-timeframe, image)")
+             f"multi-timeframe, confirmation sur {settings.ANALYSIS_CONFIRMATION_SECONDS} s, image)")
     try:
         png, text, caption = await run_full_analysis(market, asset, timeframe)
     except (FeedError, InsufficientData) as e:

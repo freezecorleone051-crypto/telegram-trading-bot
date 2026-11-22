@@ -2,13 +2,19 @@
 Catalogue des marchés, actifs et sources de cours.
 
 Le bot ne se connecte pas au broker : pour un même actif, le graphique est
-le même partout (même marché sous-jacent). Crypto via l'API publique Binance,
-tout le reste (forex, actions, ETF, indices, matières premières) via Yahoo
-Finance. Les actifs « OTC » sont routés vers l'actif réel correspondant
-(attention : voir l'avertissement OTC dans le README).
+le même partout (même marché sous-jacent). data/feed.py essaie Deriv en premier,
+puis Binance pour les cryptos et Yahoo Finance comme source de secours.
+Les actifs « OTC » sont routés vers l'actif réel correspondant (attention :
+voir l'avertissement OTC dans le README).
 
 Pour ajouter un actif, ajoute UNE ligne dans la liste de sa famille plus bas
 (voir `_stock(...)`, `_crypto(...)`, etc.) — rien d'autre à modifier.
+
+IMPORTANT (correction du 21/11) : les tables de routage OTC_ROUTE,
+FOREX_SYMBOLS, FOREX_FALLBACKS et CRYPTO_YF_FALLBACK en bas de fichier sont
+OBLIGATOIRES : data/feed.py les utilise pour récupérer les cours. Elles sont
+calculées automatiquement à partir du CATALOGUE — si tu ajoutes un actif,
+elles se mettent à jour toutes seules, ne touche à rien d'autre.
 """
 import re
 from dataclasses import dataclass, field
@@ -125,7 +131,7 @@ def _otc(name, label, yf, binance=None, decimals=None, fallbacks=()):
 # Catalogue
 # ------------------------------------------------------------------
 CATALOG = {
-    # Crypto : cours en direct via l'API publique Binance (aucune clé)
+    # Crypto : Deriv en priorité, Binance et Yahoo en secours
     "crypto": [
         _crypto("BTC", "Bitcoin"), _crypto("ETH", "Ethereum"),
         _crypto("BNB", "BNB"), _crypto("SOL", "Solana"),
@@ -134,7 +140,7 @@ CATALOG = {
         _crypto("LINK", "Chainlink"), _crypto("DOT", "Polkadot"),
         _crypto("LTC", "Litecoin"), _crypto("TRX", "Tron"),
     ],
-    # Forex & Or : cours Yahoo Finance
+    # Forex & Or : Deriv en priorité, Yahoo Finance en secours
     "forex": [
         _forex("EUR/USD"), _forex("GBP/USD"), _forex("USD/JPY"),
         _forex("AUD/USD"), _forex("USD/CAD"), _forex("USD/CHF"),
@@ -205,17 +211,17 @@ CATALOG = {
 MARKET_ORDER = ["crypto", "stocks", "etf", "indices", "commodities", "forex", "otc"]
 
 MARKET_INFO = {
-    "crypto": {"label": "Crypto (source : Binance)", "button": "Crypto",
+    "crypto": {"label": "Crypto (Deriv, Binance/Yahoo en secours)", "button": "Crypto",
                "timeframes": ["1m", "5m", "15m", "1h", "4h", "1d", "1w"]},
-    "stocks": {"label": "Actions US (source : Yahoo Finance)", "button": "Actions",
+    "stocks": {"label": "Actions US (Deriv / Yahoo Finance)", "button": "Actions",
                "timeframes": ["5m", "15m", "1h", "1d", "1w"]},
-    "etf": {"label": "ETF (source : Yahoo Finance)", "button": "ETF",
+    "etf": {"label": "ETF (Deriv / Yahoo Finance)", "button": "ETF",
             "timeframes": ["5m", "15m", "1h", "1d", "1w"]},
-    "indices": {"label": "Indices boursiers (source : Yahoo Finance)",
+    "indices": {"label": "Indices boursiers (Deriv / Yahoo Finance)",
                 "button": "Indices", "timeframes": ["5m", "15m", "1h", "1d", "1w"]},
-    "commodities": {"label": "Matières premières (source : Yahoo Finance)",
+    "commodities": {"label": "Matières premières (Deriv / Yahoo Finance)",
                     "button": "Matières 1res", "timeframes": ["5m", "15m", "1h", "1d", "1w"]},
-    "forex": {"label": "Forex & Or (source : Yahoo Finance)", "button": "Forex & Or",
+    "forex": {"label": "Forex & Or (Deriv / Yahoo Finance)", "button": "Forex & Or",
               "timeframes": ["1m", "5m", "15m", "1h", "4h", "1d", "1w"]},
     "otc": {"label": "OTC / Binaires (cours de l'actif réel)", "button": "OTC",
             "timeframes": ["1m", "5m", "15m", "1h"]},
@@ -233,6 +239,29 @@ _BY_KEY = {(a.market, a.name): a for m in MARKET_ORDER for a in CATALOG[m]}
 CRYPTO_ASSETS = [a.name for a in CATALOG["crypto"]]
 FOREX_ASSETS = [a.name for a in CATALOG["forex"]]
 OTC_ASSETS = [a.name for a in CATALOG["otc"]]
+
+# ------------------------------------------------------------------
+# Tables de routage (OBLIGATOIRES pour data/feed.py) — calculées
+# automatiquement à partir du CATALOGUE. Ne pas supprimer : sans elles,
+# plus aucun cours forex / OTC / secours crypto ne peut être récupéré.
+# ------------------------------------------------------------------
+# Symbole yfinance par actif forex (ex. "EUR/USD" -> "EURUSD=X")
+FOREX_SYMBOLS = {a.name: a.yf for a in CATALOG["forex"] if a.yf}
+
+# Symboles Yahoo de secours par actif forex (ex. XAU/USD -> XAUUSD=X)
+FOREX_FALLBACKS = {a.name: list(a.yf_fallbacks)
+                   for a in CATALOG["forex"] if a.yf_fallbacks}
+
+# Secours Yahoo par actif crypto (utilisé quand Binance est indisponible)
+CRYPTO_YF_FALLBACK = {a.name: a.yf for a in CATALOG["crypto"] if a.yf}
+
+# Routage des actifs OTC vers leur source de cours : ("binance"|"yfinance", symbole)
+OTC_ROUTE = {}
+for _a in CATALOG["otc"]:
+    if _a.binance:
+        OTC_ROUTE[_a.name] = ("binance", _a.binance)
+    elif _a.yf:
+        OTC_ROUTE[_a.name] = ("yfinance", _a.yf)
 
 
 # ------------------------------------------------------------------
