@@ -40,8 +40,42 @@ async def _analyze_safe(market, asset, tf, sem, mtf_mode="signal_only"):
             return None, f"{type(e).__name__}: {e}"
 
 
-async def run_scan(bot, send_to: int) -> int:
-    """Un cycle de scan. Renvoie le nombre d'alertes envoyées."""
+def _chat_ids(send_to) -> list[int]:
+    """Un ID ou une liste d'IDs, sans doublon ni valeur vide."""
+    raw = send_to if isinstance(send_to, (list, tuple, set)) else [send_to]
+    ids: list[int] = []
+    for item in raw:
+        try:
+            cid = int(item)
+        except (TypeError, ValueError):
+            continue
+        if cid > 0 and cid not in ids:
+            ids.append(cid)
+    return ids
+
+
+async def _send_each(chat_ids, send) -> int:
+    """Appelle send(chat_id) pour chaque destinataire. Lève si personne n'a reçu."""
+    ok = 0
+    last_error = None
+    for cid in chat_ids:
+        try:
+            await send(cid)
+            ok += 1
+        except Exception as e:
+            last_error = e
+            log.warning("Envoi à %s impossible : %s", cid, e)
+    if ok == 0 and last_error is not None:
+        raise last_error
+    return ok
+
+
+async def run_scan(bot, send_to) -> int:
+    """Un cycle de scan. Renvoie le nombre d'alertes envoyées.
+
+    `send_to` est un ID ou une liste : chaque alerte part à tous les destinataires.
+    """
+    chat_ids = _chat_ids(send_to)
     # 1) suivi des signaux ouverts + notification des résultats
     try:
         closed = await asyncio.to_thread(history.update_open_signals, feed.fetch_candles)
@@ -49,9 +83,12 @@ async def run_scan(bot, send_to: int) -> int:
             log.info("Suivi : %s %s %s -> %s (%+.2f R)", sig["asset"], sig["tf"],
                      sig["direction"], sig["status"], sig.get("r", 0))
             if sig["status"] in ("win", "loss", "expired"):
+                text = messages.build_result_message(sig)
                 try:
-                    await bot.send_message(chat_id=send_to, text=messages.build_result_message(sig),
-                                           parse_mode="HTML")
+                    await _send_each(
+                        chat_ids,
+                        lambda cid, text=text: bot.send_message(
+                            chat_id=cid, text=text, parse_mode="HTML"))
                 except Exception as e:
                     log.warning("Résultat non envoyé : %s", e)
     except Exception as e:
@@ -89,16 +126,23 @@ async def run_scan(bot, send_to: int) -> int:
             png = await asyncio.to_thread(
                 make_chart, res["df"], signal, asset, tf, res["source"],
                 _label(market, asset), markets.decimals_for(market, asset))
-            await bot.send_photo(chat_id=send_to, photo=png,
-                                 caption=messages.signal_caption(asset, tf, signal)[:1024])
-            await bot.send_message(
-                chat_id=send_to,
-                text=messages.build_signal_message(market, asset, tf, signal, res["source"],
-                                                   res["mtf_text"], res["stale"], res["age_s"]),
-                parse_mode="HTML", disable_web_page_preview=True)
-            alerts += 1
-            log.info("Alerte envoyée : %s %s %s score %s/%s", asset, tf,
-                     signal["direction"], signal["score"], signal["max_points"])
+            caption = messages.signal_caption(asset, tf, signal)[:1024]
+            text = messages.build_signal_message(
+                market, asset, tf, signal, res["source"],
+                res["mtf_text"], res["stale"], res["age_s"])
+
+            async def _push(cid, png=png, caption=caption, text=text):
+                await bot.send_photo(chat_id=cid, photo=png, caption=caption)
+                await bot.send_message(
+                    chat_id=cid, text=text, parse_mode="HTML",
+                    disable_web_page_preview=True)
+
+            delivered = await _send_each(chat_ids, _push)
+            if delivered:
+                alerts += 1
+                log.info("Alerte envoyée à %s destinataire(s) : %s %s %s score %s/%s",
+                         delivered, asset, tf, signal["direction"],
+                         signal["score"], signal["max_points"])
         except Exception as e:      # jamais tuer le scan pour une erreur d'envoi
             log.error("Scan %s : envoi impossible (%s)", key, e)
     return alerts

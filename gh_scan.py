@@ -83,11 +83,11 @@ def _timeout_s() -> int:
 
 async def send_test_message() -> None:
     """Message de test : prouve que le token et l'ID sont bons."""
+    text = ("✅ Scan GitHub Actions opérationnel : ton bot peut t'écrire.\n"
+            "Tu recevras ici les alertes ACHAT / VENTE confirmées.")
     async with _make_bot() as bot:
-        await bot.send_message(
-            chat_id=settings.ADMIN_ID,
-            text="✅ Scan GitHub Actions opérationnel : ton bot peut t'écrire.\n"
-                 "Tu recevras ici les alertes ACHAT / VENTE confirmées.")
+        for cid in settings.recipient_ids():
+            await bot.send_message(chat_id=cid, text=text)
 
 
 async def run_scan() -> dict:
@@ -100,7 +100,7 @@ async def run_scan() -> dict:
         log.warning("Watchlist vide : rien à scanner (définis la variable WATCHLIST).")
     started = time.monotonic()
     async with _make_bot() as bot:
-        alerts = await scanner.run_scan(bot, settings.ADMIN_ID)
+        alerts = await scanner.run_scan(bot, settings.recipient_ids())
     bilan = dict(scanner.LAST_RUN)
     bilan["alerts"] = alerts
     bilan["seconds"] = round(time.monotonic() - started, 1)

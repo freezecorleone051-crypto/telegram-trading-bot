@@ -561,7 +561,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE):
         return
     async with _scan_lock:
         try:
-            alerts = await scanner.run_scan(context.bot, settings.ADMIN_ID)
+            alerts = await scanner.run_scan(context.bot, settings.recipient_ids())
             if alerts:
                 log.info("Scan terminé : %s alerte(s) envoyée(s)", alerts)
         except Exception:
@@ -587,15 +587,15 @@ async def post_init(application: Application):
     resumed = False
     if settings.SCAN_AUTOSTART or history.get_scan_enabled():
         resumed = _start_scan_job(application.job_queue)
-    try:
-        await application.bot.send_message(
-            chat_id=settings.ADMIN_ID,
-            text="Bot démarré ! /start pour choisir un marché, /top pour classer les "
-                 "opportunités, /scan on pour le scan automatique, /stats et /backtest pour "
-                 "mesurer l'efficacité, /help pour tout voir."
-                 + ("\nScan automatique : REPRIS." if resumed else ""))
-    except Exception as e:
-        log.warning("Message de démarrage non envoyé : %s", e)
+    text = ("Bot démarré ! /start pour choisir un marché, /top pour classer les "
+            "opportunités, /scan on pour le scan automatique, /stats et /backtest pour "
+            "mesurer l'efficacité, /help pour tout voir."
+            + ("\nScan automatique : REPRIS." if resumed else ""))
+    for chat_id in settings.recipient_ids():
+        try:
+            await application.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            log.warning("Message de démarrage non envoyé à %s : %s", chat_id, e)
 
 
 def main():
