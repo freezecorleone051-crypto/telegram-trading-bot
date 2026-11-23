@@ -188,17 +188,39 @@ def build_watchlist_message(items: list) -> str:
 
 
 def build_markets_message() -> str:
-    lines = ["<b>Marchés supportés</b>", ""]
-    for m in markets.MARKET_ORDER:
-        names = []
-        for a in markets.CATALOG[m]:
-            names.append(a.name if (not a.label or a.label == a.name or m in ("crypto", "forex", "otc"))
-                         else f"{a.name} ({a.label})")
-        lines.append(f"<b>{html.escape(market_label(m))}</b>\n" + html.escape(", ".join(names)) + "\n")
-    lines.append("Timeframes : " + ", ".join(markets.TIMEFRAMES)
-                 + " (actions/ETF/indices/matières : 5m, 15m, 1h, 1d, 1w)")
-    lines.append("\nExemples : /analyse nvidia 1h — /analyse BTC 15m — /analyse or 1h — "
-                 "/analyse dax 1d — /top actions 1h")
+    hfm_catalogue = markets.hfm_assets()
+    if hfm_catalogue:
+        lines = ["<b>Catalogue de ton compte HFM MT5</b>",
+                 f"{len(hfm_catalogue)} instruments négociables détectés.",
+                 "Les symboles ci-dessous sont les noms exacts lus dans ton terminal.", ""]
+        for market in markets.MARKET_ORDER:
+            items = markets.hfm_assets(market)
+            if not items:
+                continue
+            shown = [item.name for item in items[:8]]
+            remaining = len(items) - len(shown)
+            heading = f"{markets.MARKET_INFO[market]['button']} — {len(items)}"
+            lines.append(f"<b>{html.escape(heading)}</b>")
+            lines.append(html.escape(", ".join(shown)))
+            if remaining:
+                lines.append(f"… et {remaining} autres. Utilise /analyse SYMBOLE 15m.")
+            lines.append("")
+        lines.append("/hfm refresh — actualiser le catalogue ; /scan on — surveiller "
+                     "tous ces instruments ; /analyse SYMBOLE 15m — analyser un instrument.")
+        return "\n".join(lines)
+
+    # Mode hors connexion HFM : garde l'ancien catalogue manuel.
+    lines = ["<b>Marchés historiques disponibles (hors catalogue HFM)</b>", ""]
+    for market in markets.MARKET_ORDER:
+        static_items = markets.CATALOG.get(market, [])
+        if not static_items:
+            continue
+        names = [item.name if (not item.label or item.label == item.name
+                               or market in ("crypto", "forex", "otc"))
+                 else f"{item.name} ({item.label})" for item in static_items]
+        lines.append(f"<b>{html.escape(market_label(market))}</b>\n"
+                     + html.escape(", ".join(names)) + "\n")
+    lines.append("Pour connecter ton compte HFM : ouvre MT5 sur Windows puis tape /hfm.")
     return "\n".join(lines)
 
 

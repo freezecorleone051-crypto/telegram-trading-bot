@@ -1,7 +1,6 @@
 # Bot Telegram de signaux de trading (privé, multi-fichiers)
 
-Bot Telegram qui analyse les graphiques de trading sur 3 familles de marchés
-(crypto, forex, OTC/binaires) et t'envoie un signal **ACHAT / VENTE** avec
+Bot Telegram qui analyse les marchés disponibles sur HFM MetaTrader 5 (et les sources de secours pour les actifs non proposés par HFM) et t'envoie un signal **ACHAT / VENTE** avec
 entrée, Take Profit, Stop Loss, ratio risque/rendement et score de confiance —
 **plus une image du graphique** montrant comment il a raisonné (bougies, EMA,
 Bollinger, RSI, MACD, niveaux tracés).
@@ -18,8 +17,9 @@ telegram-trading-bot/
 ├── config/
 │   └── settings.py         # toute la configuration (.env + constantes)
 ├── data/
-│   ├── markets.py          # catalogue des marchés, actifs, sources
-│   └── feed.py             # Deriv prioritaire, Binance/Yahoo en secours + cache
+│   ├── markets.py          # catalogue statique + catalogue HFM découvert à l'exécution
+│   ├── feed.py             # routage des sources, bougies clôturées et cache
+│   └── mt5_provider.py     # lecture des symboles, ticks et bougies HFM via MT5
 ├── core/                   # le cerveau : tout le calcul technique
 │   ├── indicators.py       # EMA, RSI, MACD, ATR, Bollinger, Stochastique
 │   ├── patterns.py         # chandeliers japonais (pin bar, englobante, ...)
@@ -27,7 +27,7 @@ telegram-trading-bot/
 │   └── risk.py             # TP/SL, ratio R:R, taille de position
 ├── services/
 │   ├── mtf.py              # contrôle multi-timeframe (5m/15m/1h...)
-│   └── scanner.py          # scan automatique de la watchlist
+│   └── scanner.py          # scan automatique de l’univers HFM
 ├── outputs/
 │   ├── chart.py            # génération de l'image d'analyse
 │   └── messages.py         # textes des messages Telegram
@@ -67,9 +67,10 @@ un actif dans `data/markets.py` ou une commande dans `bot.py` sans tout casser.
 | `/analyse BTC 5m` | analyse complète immédiate + image |
 | `/analyse EUR/USD 15m` | idem forex ; `/analyse XAU 1h` pour l'or |
 | `/prix BTC` | prix en direct + variation 24h |
-| `/marches` | tous les actifs supportés |
-| `/scan on` / `/scan off` | scan automatique de la watchlist |
-| `/watch add ETH 15m` | ajouter un actif à la watchlist (persistant) |
+| `/marches` | marchés connus et symboles HFM découverts |
+| `/hfm` / `/hfm refresh` | état MT5, nombre d'instruments et actualisation du catalogue HFM |
+| `/scan on` / `/scan off` | scan automatique de tous les instruments négociables découverts sur HFM MT5 |
+| `/watch add ETH 15m` | modifier la watchlist historique (utilisée lorsque le scan univers HFM est désactivé) |
 | `/watch remove ETH 15m` | retirer ; `/watch clear` tout vider |
 | `/stats` | résultats des signaux passés (TP touché vs SL touché) |
 | `/id` | ton ID Telegram |
@@ -120,9 +121,7 @@ que le bot tourne (voir section 7 pour le faire tourner en continu).
 
 ### Étape 6 — vérifier les tests (optionnel mais conseillé)
 ```bash
-python tests/test_indicators.py
-python tests/test_patterns.py
-python tests/test_signal_engine.py
+pytest -q
 ```
 
 ---
@@ -157,30 +156,39 @@ Décision :
 
 ---
 
-## 5. Marchés et sources (le point sur le "courtier")
+## 5. Marchés et sources de données
 
-Tu avais raison : deux plateformes qui affichent le **même actif** montrent le
-**même graphique**, car le cours vient du même marché. Le bot ne se connecte
-pas à ton broker :
+### HFM MetaTrader 5 (source prioritaire)
 
-| Famille | Ordre des sources | Actifs |
-|---|---|---|
-| Toutes les familles | **Deriv en premier** si l'instrument exact est listé, puis source de secours | Forex, crypto et instruments Deriv disponibles |
-| Crypto | **Deriv → Binance → Yahoo Finance** | BTC, ETH, BNB, SOL, XRP, ADA, DOGE (USDT) |
-| Forex, actions, ETF, indices, matières premières | **Deriv → Yahoo Finance** | Actifs du catalogue, uniquement si le symbole Deriv correspond exactement |
-| OTC / binaires | Données de l'actif réel correspondant ; Deriv en priorité s'il est listé | EUR/USD OTC, GBP/USD OTC, USD/JPY OTC, XAU/USD OTC, BTC/USD OTC, ETH/USD OTC |
+Sur Windows, le bot se connecte au terminal MetaTrader 5 déjà ouvert et authentifié. Il ne demande ni ne stocke le mot de passe HFM. Au démarrage et lors du rafraîchissement du catalogue, il lit les symboles disponibles dans le terminal avec `symbols_get()`, classe les instruments selon les groupes et les métadonnées MT5, puis analyse les symboles avec leurs noms exacts de broker.
 
-- Les données de marché publiques Deriv ne nécessitent pas de jeton personnel.
-- Binance et Yahoo Finance sont utilisés automatiquement si Deriv ne propose pas
-  l'actif ou si son flux est indisponible.
-- `/prix` demande le dernier tick Deriv en direct ; si Deriv ne fournit pas ce
-  symbole, le bot affiche la dernière bougie disponible de la source de secours.
-- Les analyses techniques utilisent des bougies clôturées pour éviter de baser
-  un signal sur une bougie encore incomplète.
-- `/analyse` démarre immédiatement, sans pause ni deuxième passe forcée.
-- Le forex ferme le week-end : "aucune donnée" samedi/dimanche est normal.
-- Ton broker peut afficher un écart minuscule (spread) : vérifie l'entrée sur
-  ta plateforme avant de trader.
+Les symboles HFM découverts sont toujours analysés depuis HFM MT5. Si les bougies HFM d'un symbole sont indisponibles, le bot ne bascule pas silencieusement vers Yahoo Finance, Deriv ou Binance pour ce même symbole : il signale une erreur. Cela évite de te donner une entrée calculée sur une cotation différente de celle de ton compte.
+
+Le scanner `/scan on` surveille **uniquement tous les instruments négociables découverts dans le catalogue HFM**. Il utilise le timeframe par défaut du marché (15m pour Forex/crypto ; 1h pour les autres catégories), puis exécute les contrôles multi-timeframe déjà présents lorsqu'un signal apparaît. Les signaux ACHAT/VENTE confirmés sont envoyés selon le format historique du bot : image du graphique puis message détaillé. Les signaux ATTENDRE ne deviennent pas des alertes, comme dans le fonctionnement d'origine. La watchlist historique (`/watch`) est conservée et redevient le périmètre du scan si le mode `SCAN_ALL_HFM_SYMBOLS` est désactivé.
+
+### Sources complémentaires pour les analyses manuelles
+
+| Situation | Source utilisée |
+|---|---|
+| Instrument découvert dans HFM MT5 | **HFM MT5 uniquement** |
+| Crypto statique absente de HFM, analysée manuellement | Deriv, puis Binance, puis Yahoo Finance selon le catalogue |
+| Autre actif statique absent de HFM, analysé manuellement | Deriv, puis Yahoo Finance selon le catalogue |
+
+Les bougies en formation sont écartées avant l'analyse. L'alerte conserve le nom exact du symbole et la source (par exemple `HFM MT5 (EURUSD)`). Les images, indicateurs, score, seuils, TP, SL, messages Telegram, cooldown et suivi TP/SL restent ceux du projet d'origine.
+
+### Installation et connexion HFM
+
+1. Installe MetaTrader 5 pour Windows et connecte ton compte HFM Premium dans le terminal de bureau.
+2. Depuis le dossier du projet, installe les dépendances : `python -m pip install -r requirements.txt`. Sur Windows x64, ce fichier installe aussi le connecteur officiel `MetaTrader5`.
+3. Lance le bot avec `python bot.py`.
+4. Dans Telegram, tape `/hfm`. Le bot doit afficher la connexion et le nombre d'instruments détectés. Utilise `/hfm refresh` après avoir ajouté de nouveaux symboles dans MT5.
+5. Tape `/marches` pour voir les catégories et une partie des symboles, puis `/scan on` pour démarrer le scan complet. Les symboles non affichés dans la liste restent accessibles avec `/analyse SYMBOLE 15m`.
+
+`MT5_PATH` et `MT5_SERVER` sont facultatifs dans `.env`. Ne mets jamais ton mot de passe HFM, ton token Telegram ou tes identifiants dans le code partagé. Le terminal doit rester ouvert et connecté pendant le scan.
+
+**Hébergement :** le workflow GitHub Actions fourni utilise un runner Ubuntu. Il ne peut pas s'attacher à ton terminal HFM local Windows. Pour les cours HFM directs, lance le bot sur ton PC Windows ou sur un VPS Windows sur lequel MT5 est installé et connecté. Le workflow GitHub Actions reste un mode historique utilisant les sources non-MT5 et une watchlist limitée.
+
+**Sécurité d'exécution :** cette intégration ne passe aucun ordre. Elle utilise la connexion MT5 uniquement pour lire l'état du terminal, la liste des symboles, les ticks et les bougies. Le bot conserve le rôle de générateur de signaux Telegram, et tu continues à placer les transactions manuellement.
 
 ---
 
@@ -203,9 +211,13 @@ pas à ton broker :
 | `NB_CANDLES_CHART` | 80 | bougies dessinées sur l'image |
 | `FEED_CACHE_TTL` | 5 | cache court des bougies (secondes) |
 | `DERIV_APP_ID` | 1089 | ID d'application public utilisé par le WebSocket Deriv |
+| `MT5_ENABLED` | 1 | active l'accès au terminal MetaTrader 5 sous Windows |
+| `MT5_PATH` | vide | chemin facultatif vers terminal64.exe |
+| `MT5_SERVER` | vide | contrôle facultatif du serveur connecté |
+| `MT5_SYMBOL_REFRESH_MIN` | 30 | fréquence d'actualisation du catalogue HFM |
+| `SCAN_ALL_HFM_SYMBOLS` | 1 | surveille tous les symboles négociables découverts chez HFM |
 
-Pour ajouter des actifs : `data/markets.py` (`CRYPTO_ASSETS`, `FOREX_ASSETS`,
-`OTC_ASSETS`, `OTC_ROUTE`).
+Les symboles HFM sont découverts automatiquement depuis MT5 ; le catalogue statique reste dans `data/markets.py`.
 
 ---
 

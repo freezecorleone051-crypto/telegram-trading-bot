@@ -66,6 +66,9 @@ jobs:
           # Reçoit les mêmes alertes et le même accès que l'admin.
           ALLOWED_IDS: "8733754404"
           SCAN_AUTOSTART: "true"
+          # Runner Ubuntu : impossible d'accéder au terminal HFM MT5 du PC Windows.
+          # Ce workflow garde uniquement le mode historique à watchlist / sources publiques.
+          MT5_ENABLED: "false"
           # Variable GitHub WATCHLIST si elle existe, sinon cette liste.
           # Format : marché:actif:timeframe, séparés par des virgules.
           WATCHLIST: ${{ vars.WATCHLIST || 'crypto:BTC/USDT:5m,crypto:ETH/USDT:5m,crypto:SOL/USDT:15m,forex:EUR/USD:5m,forex:GBP/USD:15m,forex:XAU/USD:15m,otc:BTC/USD OTC:15m,otc:EUR/USD OTC:15m' }}

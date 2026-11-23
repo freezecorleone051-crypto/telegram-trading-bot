@@ -1,7 +1,8 @@
 """Market data providers and candle handling.
 
-Deriv is queried first across all supported market families. Binance and Yahoo
-Finance remain fallbacks for unlisted instruments or provider outages.
+Symbols discovered in the connected HFM MT5 terminal are read exclusively
+from HFM to preserve broker-specific quotes. Other manually configured assets
+retain the legacy Deriv / Binance / Yahoo Finance provider chain.
 """
 import json
 import logging
@@ -14,7 +15,7 @@ import websockets.sync.client
 import yfinance as yf
 
 from config import settings
-from data import markets
+from data import markets, mt5_provider
 
 log = logging.getLogger("tradingbot.feed")
 
@@ -325,12 +326,32 @@ def fetch_yfinance(market, asset, timeframe, limit=MAX_BARS):
     raise FeedError("Yahoo Finance indisponible (" + "; ".join(errors) + ")")
 
 
+def _fetch_mt5(market, asset, timeframe, limit):
+    try:
+        return mt5_provider.fetch_candles(market, asset, timeframe, limit)
+    except mt5_provider.MT5ProviderError as exc:
+        raise FeedError(str(exc)) from exc
+
+
 def _provider_chain(market, asset, timeframe, limit):
-    providers = [_fetch_deriv]
-    if market == "crypto" or (market == "otc" and
-                              markets.OTC_ROUTE.get(asset, (None,))[0] == "binance"):
-        providers.append(_fetch_binance)
-    providers.append(fetch_yfinance)
+    item = markets.get_asset(market, asset)
+    # Un symbole découvert dans le terminal HFM est toujours analysé depuis
+    # HFM. Pas de repli silencieux vers Yahoo/Deriv/Binance qui afficherait
+    # une cotation différente de celle utilisée pour ouvrir le trade.
+    hfm_only = False
+    if settings.MT5_ENABLED and item and item.hfm_symbol:
+        providers = [_fetch_mt5]
+        hfm_only = True
+    elif settings.MT5_ENABLED and mt5_provider.has_symbol(market, asset):
+        providers = [_fetch_mt5]
+        hfm_only = True
+    else:
+        providers = [_fetch_deriv]
+    if not hfm_only:
+        if market == "crypto" or (market == "otc" and
+                                  markets.OTC_ROUTE.get(asset, (None,))[0] == "binance"):
+            providers.append(_fetch_binance)
+        providers.append(fetch_yfinance)
 
     errors = []
     for provider in providers:
@@ -355,6 +376,12 @@ def _provider_chain(market, asset, timeframe, limit):
 
 def fetch_candles(market, asset, timeframe, limit=MAX_BARS):
     """Return (closed OHLCV candles, provider name) using provider failover."""
+    if (settings.MT5_ENABLED and market in markets.CATALOG
+            and asset not in markets.assets_for(market)):
+        try:
+            mt5_provider.refresh_catalog()
+        except mt5_provider.MT5ProviderError as exc:
+            log.info("Découverte HFM indisponible : %s", exc)
     if market not in markets.CATALOG or asset not in markets.assets_for(market):
         raise FeedError(f"actif inconnu : {market}/{asset}")
     if timeframe not in markets.fetchable_timeframes(market):
@@ -378,6 +405,24 @@ def fetch_history(market, asset, timeframe, bars):
 
 
 def fetch_price(market, asset):
+    if settings.MT5_ENABLED and mt5_provider.has_symbol(market, asset):
+        try:
+            tick = mt5_provider.fetch_tick(market, asset)
+        except mt5_provider.MT5ProviderError as exc:
+            raise FeedError(f"cotation HFM indisponible pour {asset} : {exc}") from exc
+        change_pct = None
+        try:
+            hourly, _source = fetch_candles(market, asset, "1h", 48)
+            if len(hourly) >= 25:
+                previous = float(hourly["close"].iloc[-25])
+                if previous:
+                    change_pct = ((tick["price"] / previous) - 1) * 100
+        except FeedError as exc:
+            log.info("Variation 24h MT5 indisponible pour %s : %s", asset, exc)
+        return {"price": tick["price"], "change_pct": change_pct,
+                "span": "sur 24h", "source": f"HFM MT5 ({tick['symbol']})",
+                "live": True}
+
     hourly = None
     history_source = None
     history_error = None

@@ -1,11 +1,10 @@
 """
 Catalogue des marchés, actifs et sources de cours.
 
-Le bot ne se connecte pas au broker : pour un même actif, le graphique est
-le même partout (même marché sous-jacent). data/feed.py essaie Deriv en premier,
-puis Binance pour les cryptos et Yahoo Finance comme source de secours.
-Les actifs « OTC » sont routés vers l'actif réel correspondant (attention :
-voir l'avertissement OTC dans le README).
+Le catalogue statique conserve les actifs historiques du bot. Les instruments
+HFM réellement exposés par le terminal MT5 sont ajoutés dynamiquement au
+catalogue à chaque découverte. Les actifs « OTC » restent routés vers l'actif
+réel correspondant (attention : voir l'avertissement OTC dans le README).
 
 Pour ajouter un actif, ajoute UNE ligne dans la liste de sa famille plus bas
 (voir `_stock(...)`, `_crypto(...)`, etc.) — rien d'autre à modifier.
@@ -85,6 +84,9 @@ class Asset:
     aliases: tuple = ()       # autres noms reconnus : ("gold", "or")
     decimals: int | None = None  # décimales d'affichage (None = automatique)
     session: str | None = None   # clé de SESSIONS (None = marché 24h)
+    hfm_symbol: str | None = None  # symbole exact découvert dans le terminal MT5
+    path: str = ""              # chemin de groupe fourni par le broker
+    trade_mode: int | None = None  # mode de négociation MT5
 
 
 # ------------------------------------------------------------------
@@ -205,26 +207,30 @@ CATALOG = {
         _otc("BTC/USD OTC", "BTC/USD OTC", "BTC-USD", binance="BTCUSDT"),
         _otc("ETH/USD OTC", "ETH/USD OTC", "ETH-USD", binance="ETHUSDT"),
     ],
+    # Instruments MT5 qui ne rentrent pas clairement dans une catégorie connue.
+    "other": [],
 }
 
 # Ordre d'affichage / de recherche
-MARKET_ORDER = ["crypto", "stocks", "etf", "indices", "commodities", "forex", "otc"]
+MARKET_ORDER = ["crypto", "stocks", "etf", "indices", "commodities", "forex", "otc", "other"]
 
 MARKET_INFO = {
-    "crypto": {"label": "Crypto (Deriv, Binance/Yahoo en secours)", "button": "Crypto",
+    "crypto": {"label": "Cryptomonnaies", "button": "Crypto",
                "timeframes": ["1m", "5m", "15m", "1h", "4h", "1d", "1w"]},
-    "stocks": {"label": "Actions US (Deriv / Yahoo Finance)", "button": "Actions",
+    "stocks": {"label": "Actions", "button": "Actions",
                "timeframes": ["5m", "15m", "1h", "1d", "1w"]},
-    "etf": {"label": "ETF (Deriv / Yahoo Finance)", "button": "ETF",
+    "etf": {"label": "ETF", "button": "ETF",
             "timeframes": ["5m", "15m", "1h", "1d", "1w"]},
-    "indices": {"label": "Indices boursiers (Deriv / Yahoo Finance)",
+    "indices": {"label": "Indices boursiers",
                 "button": "Indices", "timeframes": ["5m", "15m", "1h", "1d", "1w"]},
-    "commodities": {"label": "Matières premières (Deriv / Yahoo Finance)",
+    "commodities": {"label": "Matières premières",
                     "button": "Matières 1res", "timeframes": ["5m", "15m", "1h", "1d", "1w"]},
-    "forex": {"label": "Forex & Or (Deriv / Yahoo Finance)", "button": "Forex & Or",
+    "forex": {"label": "Forex & Or", "button": "Forex & Or",
               "timeframes": ["1m", "5m", "15m", "1h", "4h", "1d", "1w"]},
     "otc": {"label": "OTC / Binaires (cours de l'actif réel)", "button": "OTC",
             "timeframes": ["1m", "5m", "15m", "1h"]},
+    "other": {"label": "Autres instruments HFM", "button": "Autres",
+              "timeframes": ["5m", "15m", "1h", "4h", "1d", "1w"]},
 }
 # Compatibilité avec l'ancien code
 MARKET_LABELS = {m: MARKET_INFO[m]["label"] for m in MARKET_ORDER}
@@ -233,7 +239,37 @@ MARKET_EMOJILESS = {m: MARKET_INFO[m]["button"] for m in MARKET_ORDER}
 # Marchés à séances d'ouverture (fermés la nuit / le week-end)
 SESSION_MARKETS = {"stocks", "etf", "indices", "commodities"}
 
-_BY_KEY = {(a.market, a.name): a for m in MARKET_ORDER for a in CATALOG[m]}
+_BASE_BY_KEY = {(a.market, a.name): a for m in MARKET_ORDER if m != "other" for a in CATALOG[m]}
+DYNAMIC_HFM_ASSETS: dict[str, list[Asset]] = {m: [] for m in MARKET_ORDER}
+_BY_KEY = dict(_BASE_BY_KEY)
+
+
+def register_hfm_assets(assets: list[Asset]) -> None:
+    """Replace the runtime HFM catalogue with symbols discovered from MT5.
+
+    Static assets remain available for legacy/manual analysis. HFM symbols are
+    kept separately so each scan can use the broker's exact symbol names.
+    """
+    global _BY_KEY
+    dynamic = {m: [] for m in MARKET_ORDER}
+    for asset in assets:
+        if asset.market not in dynamic or not asset.name:
+            continue
+        dynamic[asset.market].append(asset)
+    DYNAMIC_HFM_ASSETS.clear()
+    DYNAMIC_HFM_ASSETS.update(dynamic)
+    _BY_KEY = dict(_BASE_BY_KEY)
+    for market, items in DYNAMIC_HFM_ASSETS.items():
+        for asset in items:
+            _BY_KEY[(market, asset.name)] = asset
+
+
+def hfm_assets(market: str | None = None) -> list[Asset]:
+    """Return the last dynamically discovered HFM symbols."""
+    if market is not None:
+        return list(DYNAMIC_HFM_ASSETS.get(market, []))
+    return [asset for m in MARKET_ORDER for asset in DYNAMIC_HFM_ASSETS.get(m, [])]
+
 
 # Rétro-compatibilité : anciennes listes de noms
 CRYPTO_ASSETS = [a.name for a in CATALOG["crypto"]]
@@ -272,7 +308,9 @@ def get_asset(market: str, name: str) -> Asset | None:
 
 
 def assets_for(market: str) -> list:
-    return [a.name for a in CATALOG.get(market, [])]
+    names = [a.name for a in CATALOG.get(market, [])]
+    names.extend(a.name for a in DYNAMIC_HFM_ASSETS.get(market, []))
+    return list(dict.fromkeys(names))
 
 
 def timeframes_for(market: str) -> list:
@@ -289,8 +327,8 @@ def fetchable_timeframes(market: str) -> list:
 
 
 def all_assets() -> list:
-    """Renvoie [(market, name), ...] pour tous les actifs connus."""
-    return [(m, a.name) for m in MARKET_ORDER for a in CATALOG[m]]
+    """Renvoie [(market, name), ...] pour les actifs statiques et HFM."""
+    return [(m, name) for m in MARKET_ORDER for name in assets_for(m)]
 
 
 def mtf_map_for(market: str) -> dict:
@@ -348,6 +386,14 @@ def find_asset(query: str):
     q = (query or "").strip()
     if not q:
         return None
+    # Une saisie exacte du symbole HFM doit primer sur une ancienne alias
+    # normalisée (ex. EURUSD doit sélectionner le symbole MT5 EURUSD).
+    q_upper = q.upper()
+    for market in MARKET_ORDER:
+        for a in DYNAMIC_HFM_ASSETS.get(market, []):
+            if a.name.upper() == q_upper:
+                return market, a.name
+
     best = None
     for order, (market, name) in enumerate(all_assets()):
         a = _BY_KEY[(market, name)]
@@ -379,7 +425,7 @@ def infer_market(asset: str) -> str:
 # Aide à la saisie (commandes Telegram)
 # ------------------------------------------------------------------
 DEFAULT_TIMEFRAME = {"crypto": "15m", "forex": "15m", "otc": "5m", "stocks": "1h",
-                     "etf": "1h", "indices": "1h", "commodities": "1h"}
+                     "etf": "1h", "indices": "1h", "commodities": "1h", "other": "1h"}
 
 TF_ALIASES = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "h1": "1h", "60m": "1h",
               "4h": "4h", "h4": "4h", "1d": "1d", "d": "1d", "d1": "1d", "jour": "1d",
@@ -393,6 +439,7 @@ MARKET_ALIASES = {
     "matieres": "commodities", "matières": "commodities", "commodities": "commodities",
     "matiere": "commodities", "commo": "commodities",
     "forex": "forex", "fx": "forex", "otc": "otc", "binaire": "otc", "binaires": "otc",
+    "autres": "other", "other": "other",
 }
 
 

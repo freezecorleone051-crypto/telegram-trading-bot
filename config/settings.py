@@ -124,6 +124,17 @@ if _w:
         WATCHLIST = parsed
 
 # ------------------------------------------------------------------
+# Connexion facultative au terminal MetaTrader 5 (HFM)
+# ------------------------------------------------------------------
+# Le terminal doit déjà être installé et connecté au compte HFM. Le bot
+# s'attache à cette session locale : aucun mot de passe n'est demandé ici.
+MT5_ENABLED = _bool("MT5_ENABLED", True)
+MT5_PATH = os.getenv("MT5_PATH", "").strip()
+MT5_SERVER = os.getenv("MT5_SERVER", "").strip()  # contrôle facultatif du serveur
+MT5_SYMBOL_REFRESH_MIN = max(1, _num("MT5_SYMBOL_REFRESH_MIN", 30, int))
+SCAN_ALL_HFM_SYMBOLS = _bool("SCAN_ALL_HFM_SYMBOLS", True)
+
+# ------------------------------------------------------------------
 # Gestion du risque
 # ------------------------------------------------------------------
 # Balance fictive de calcul (0 = ne pas afficher de suggestion de position).

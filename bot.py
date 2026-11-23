@@ -7,7 +7,7 @@ Commandes :
   /top [marché] [tf]     classe les opportunités d'une famille (ex : /top actions 1h)
   /prix [actif]          prix en direct + variation
   /marches               liste des marchés supportés
-  /scan on|off           scan automatique de la watchlist
+  /scan on|off           scan automatique de tous les instruments HFM
   /watch ...             gérer la watchlist (add/remove/clear)
   /stats                 résultats réels des signaux passés (en multiples de R)
   /backtest [actif] [tf] teste le moteur sur l'historique (avec coûts)
@@ -27,7 +27,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 
 from config import settings
 from core.signal_engine import InsufficientData
-from data import feed, markets
+from data import feed, markets, mt5_provider
 from data.feed import FeedError
 from outputs import chart, messages
 from services import backtest as backtest_service
@@ -76,6 +76,17 @@ def _parse_asset_tf(tokens: list):
     if tokens and markets.parse_timeframe(tokens[-1]):
         tf = markets.parse_timeframe(tokens.pop())
     return " ".join(tokens), tf
+
+
+async def _refresh_hfm_catalog(force: bool = False):
+    """Actualise la liste HFM sans bloquer la boucle Telegram."""
+    if not settings.MT5_ENABLED:
+        return []
+    try:
+        return await asyncio.to_thread(mt5_provider.refresh_catalog, force)
+    except mt5_provider.MT5ProviderError as exc:
+        log.info("Catalogue HFM non disponible : %s", exc)
+        return None
 
 
 # ==================================================================
@@ -167,13 +178,19 @@ def market_keyboard(prefix: str = "cat"):
 def asset_keyboard(market: str):
     cols = 2 if market in ("crypto", "forex", "otc") else 3
     rows, row = [], []
-    for a in markets.assets_for(market):
+    hfm_items = markets.hfm_assets(market)
+    assets = ([item.name for item in hfm_items]
+              if settings.MT5_ENABLED and hfm_items else markets.assets_for(market))
+    for a in assets[:40]:
         row.append(InlineKeyboardButton(a, callback_data=f"asset:{market}:{a}"))
         if len(row) == cols:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
+    if len(assets) > 40:
+        rows.append([InlineKeyboardButton(
+            f"{len(assets) - 40} autres — utiliser /analyse SYMBOLE", callback_data="help:assets")])
     rows.append([InlineKeyboardButton("Classer les opportunités (/top)",
                                       callback_data=f"top:{market}")])
     rows.append([InlineKeyboardButton("< Changer de marché", callback_data="back:cat")])
@@ -212,8 +229,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /top classe les opportunités d'une famille de marché.\n"
         "- /stats donne les résultats RÉELS de mes signaux, /backtest teste le moteur "
         "sur l'historique : vérifie avant de faire confiance.\n"
-        "- /scan on surveille ta watchlist et t'alerte.\n\n"
-        "<b>Commandes :</b> /analyse — /top — /prix — /marches — /scan — /watch — "
+        "- /scan on surveille tous les instruments HFM détectés et t'alerte.\n"
+        "- /hfm vérifie la connexion MT5 et le nombre de symboles détectés.\n\n"
+        "<b>Commandes :</b> /analyse — /top — /prix — /marches — /hfm — /scan — /watch — "
         "/stats — /backtest — /help — /id\n\n"
         "Choisis une famille de marché :")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML,
@@ -231,7 +249,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   ex : /top actions 1h | /top crypto 15m | /top indices 1d\n"
         "/prix [actif] — prix en direct + variation\n"
         "/marches — liste des actifs\n"
-        "/scan on / /scan off — scan automatique de la watchlist\n"
+        "/hfm — état de la connexion HFM MT5 ; /hfm refresh — recharger les symboles\n"
+        "/scan on / /scan off — scan automatique de tous les symboles HFM\n"
         "/watch add NVDA 1h — ajouter ; /watch remove NVDA 1h — retirer ; /watch clear\n"
         "/stats — résultats réels (TP / SL / espérance en R)\n"
         "/backtest [actif] [timeframe] [nb_bougies] — test sur l'historique, coûts inclus\n"
@@ -260,6 +279,7 @@ async def cmd_analyse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Quel marché veux-tu analyser ? Choisis la famille :",
                                         reply_markup=market_keyboard())
         return
+    await _refresh_hfm_catalog()
     query, tf = _parse_asset_tf(context.args)
     match = markets.find_asset(query)
     if not match:
@@ -280,13 +300,16 @@ async def cmd_analyse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @private_guard
 async def cmd_marches(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _refresh_hfm_catalog()
     await update.message.reply_text(messages.build_markets_message(),
                                     parse_mode=ParseMode.HTML)
 
 
 async def _run_top(context: ContextTypes.DEFAULT_TYPE, chat_id: int, market: str,
                    timeframe: str):
-    n = len(markets.assets_for(market))
+    hfm_items = markets.hfm_assets(market)
+    n = (len(hfm_items) if settings.MT5_ENABLED and hfm_items
+         else len(markets.assets_for(market)))
     status = await context.bot.send_message(
         chat_id=chat_id,
         text=f"Analyse de {n} actifs ({markets.MARKET_INFO[market]['button']}, {timeframe})… "
@@ -308,6 +331,7 @@ async def _run_top(context: ContextTypes.DEFAULT_TYPE, chat_id: int, market: str
 
 @private_guard
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _refresh_hfm_catalog()
     if not context.args:
         await update.message.reply_text(
             "Quelle famille classer ? (ou tape /top actions 1h)",
@@ -316,7 +340,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     market = markets.parse_market(context.args[0])
     if not market:
         await update.message.reply_text(
-            "Famille inconnue. Choisis : crypto, actions, etf, indices, matieres, forex, otc.\n"
+            "Famille inconnue. Choisis : crypto, actions, etf, indices, matieres, forex, otc ou autres.\n"
             "Exemple : /top actions 1h")
         return
     tf = (markets.parse_timeframe(context.args[1]) if len(context.args) > 1
@@ -352,23 +376,40 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     watch = history.get_watchlist()
 
     if arg == "on":
+        hfm_assets = await _refresh_hfm_catalog()
+        if settings.MT5_ENABLED and settings.SCAN_ALL_HFM_SYMBOLS and not hfm_assets:
+            await update.message.reply_text(
+                "Scan non démarré : le bot ne parvient pas à lire le catalogue HFM depuis MT5. "
+                "Vérifie que MetaTrader 5 est ouvert et connecté à ton compte HFM sur ce PC, "
+                "puis installe MetaTrader5 avec : python -m pip install --upgrade MetaTrader5. "
+                "Aucun mot de passe ne doit être ajouté au fichier .env."
+            )
+            return
         if context.job_queue is None:
             await update.message.reply_text(
                 "Le planificateur n'est pas disponible. Installe : "
                 "pip install \"python-telegram-bot[job-queue]\"")
             return
         if jobs:
+            active_scope = (f"les {len(hfm_assets)} instruments HFM"
+                            if settings.MT5_ENABLED and settings.SCAN_ALL_HFM_SYMBOLS and hfm_assets
+                            else f"la watchlist : {_watch_text(watch)}")
             await update.message.reply_text(
-                f"Le scan automatique est DÉJÀ actif (toutes les {settings.SCAN_INTERVAL_MIN} "
-                f"min). Watchlist : {_watch_text(watch)}")
+                f"Le scan automatique est DÉJÀ actif sur {active_scope} "
+                f"(cycle toutes les {settings.SCAN_INTERVAL_MIN} min).")
             return
         _start_scan_job(context.job_queue)
         await asyncio.to_thread(history.set_scan_enabled, True)
+        universe_label = (
+            f"tous les {len(hfm_assets)} instruments HFM détectés"
+            if settings.MT5_ENABLED and settings.SCAN_ALL_HFM_SYMBOLS and hfm_assets
+            else _watch_text(watch)
+        )
         await update.message.reply_text(
-            f"Scan automatique ACTIVÉ : je surveille {_watch_text(watch)} toutes les "
-            f"{settings.SCAN_INTERVAL_MIN} min. Je t'enverrai le message + l'image dès qu'un "
-            "signal confirmé sort, puis le résultat (TP / SL) quand il tombe. Le scan "
-            "reste activé après un redémarrage du bot.")
+            f"Scan automatique ACTIVÉ : je surveille {universe_label} toutes les "
+            f"{settings.SCAN_INTERVAL_MIN} min. Les signaux ACHAT/VENTE confirmés "
+            "seront envoyés avec le graphique et le détail Telegram. Aucun ordre ne sera exécuté. "
+            "Le scan reste activé après un redémarrage du bot.")
     elif arg == "off":
         for j in jobs:
             j.schedule_removal()
@@ -384,6 +425,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @private_guard
 async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _refresh_hfm_catalog()
     args = context.args
     if not args or args[0].lower() not in ("add", "remove", "clear", "list"):
         await update.message.reply_text(
@@ -416,9 +458,14 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 + ", ".join(markets.timeframes_for(market)))
             return
         ok = await asyncio.to_thread(history.watchlist_add, market, asset, tf)
+        if settings.MT5_ENABLED and settings.SCAN_ALL_HFM_SYMBOLS:
+            note = (" La watchlist historique n'élargit pas le scan univers HFM ; "
+                    "elle sera utilisée si SCAN_ALL_HFM_SYMBOLS=0.")
+        else:
+            note = " Cet actif sera pris en compte par le scan de la watchlist."
         await update.message.reply_text(
-            f"{asset} ({tf}) ajouté à la watchlist. Si le scan est actif (/scan on), il sera "
-            "surveillé." if ok else f"{asset} ({tf}) est déjà dans la watchlist.")
+            (f"{asset} ({tf}) ajouté à la watchlist.{note}" if ok
+             else f"{asset} ({tf}) est déjà dans la watchlist."))
     else:
         ok = await asyncio.to_thread(history.watchlist_remove, market, asset, tf)
         await update.message.reply_text(f"{asset} ({tf}) retiré." if ok
@@ -486,6 +533,7 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @private_guard
 async def cmd_prix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _refresh_hfm_catalog()
     query = " ".join(context.args) if context.args else "BTC"
     match = markets.find_asset(query)
     if not match:
@@ -503,6 +551,32 @@ async def cmd_prix(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                      info["span"], markets.decimals_for(market, asset), query,
                                      info.get("live", False)),
         parse_mode=ParseMode.HTML)
+
+
+@private_guard
+async def cmd_hfm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """État de la connexion MT5 et nombre d'instruments découverts."""
+    if not settings.MT5_ENABLED:
+        await update.message.reply_text("La connexion HFM MT5 est désactivée (MT5_ENABLED=0).")
+        return
+    force = bool(context.args and context.args[0].lower() == "refresh")
+    assets = await _refresh_hfm_catalog(force=force)
+    if not assets:
+        await update.message.reply_text(
+            "HFM MT5 non disponible. Ouvre MetaTrader 5 sur Windows, vérifie que ton "
+            "compte HFM est connecté, puis tape /hfm refresh. Le bot n'a besoin d'aucun "
+            "mot de passe dans Telegram ou dans son code."
+        )
+        return
+    from collections import Counter
+    counts = Counter(item.market for item in assets)
+    lines = ["<b>Connexion HFM MT5 : active</b>",
+             f"Instruments négociables détectés : <b>{len(assets)}</b>"]
+    for market in markets.MARKET_ORDER:
+        if counts.get(market):
+            lines.append(f"• {html.escape(markets.MARKET_INFO[market]['button'])} : {counts[market]}")
+    lines.append("\nLes noms affichés sont ceux du terminal HFM. Aucune fonction d'envoi d'ordre n'est utilisée.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -586,12 +660,20 @@ async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
 # ==================================================================
 async def post_init(application: Application):
     resumed = False
+    hfm_assets = await _refresh_hfm_catalog()
     if settings.SCAN_AUTOSTART or history.get_scan_enabled():
         resumed = _start_scan_job(application.job_queue)
+    if hfm_assets:
+        hfm_status = (f"\nHFM MT5 : connecté — {len(hfm_assets)} instruments détectés. "
+                      "/hfm pour le détail.")
+    elif hfm_assets is None:
+        hfm_status = "\nHFM MT5 : non détecté. Vérifie MT5 puis tape /hfm."
+    else:
+        hfm_status = "\nConnexion HFM MT5 désactivée dans la configuration."
     text = ("Bot démarré ! /start pour choisir un marché, /top pour classer les "
             "opportunités, /scan on pour le scan automatique, /stats et /backtest pour "
             "mesurer l'efficacité, /help pour tout voir."
-            + ("\nScan automatique : REPRIS." if resumed else ""))
+            + hfm_status + ("\nScan automatique : REPRIS." if resumed else ""))
     for chat_id in settings.recipient_ids():
         try:
             await application.bot.send_message(chat_id=chat_id, text=text)
@@ -615,7 +697,7 @@ def main():
     for name, fn in (("start", cmd_start), ("help", cmd_help), ("analyse", cmd_analyse),
                      ("top", cmd_top), ("marches", cmd_marches), ("scan", cmd_scan),
                      ("watch", cmd_watch), ("stats", cmd_stats), ("backtest", cmd_backtest),
-                     ("prix", cmd_prix), ("id", cmd_id)):
+                     ("prix", cmd_prix), ("hfm", cmd_hfm), ("id", cmd_id)):
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
