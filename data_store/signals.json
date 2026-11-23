@@ -5758,7 +5758,11 @@
    "rr": 1.5,
    "source": "Yahoo Finance (EURUSD=X)",
    "origin": "scan",
-   "status": "open"
+   "status": "win",
+   "r": 1.481,
+   "closed_time": "2026-11-23T20:54:53.339381+00:00",
+   "exit_time": "2026-11-23 20:45:00+00:00",
+   "exit_price": 1.09035
   },
   {
    "id": 287,
@@ -5778,7 +5782,26 @@
    "source": "Yahoo Finance (ETH-USD)",
    "origin": "scan",
    "status": "open"
+  },
+  {
+   "id": 288,
+   "time": "2026-11-23T20:50:13.684378+00:00",
+   "bar_time": "2026-11-23T20:30:00+00:00",
+   "market": "forex",
+   "asset": "GBP/USD",
+   "tf": "15m",
+   "direction": "VENTE",
+   "confidence": 88,
+   "score": 7,
+   "regime": "tendance",
+   "entry": 1.30332,
+   "tp": 1.3023,
+   "sl": 1.304,
+   "rr": 1.5,
+   "source": "Yahoo Finance (GBPUSD=X)",
+   "origin": "scan",
+   "status": "open"
   }
  ],
- "next_id": 288
+ "next_id": 289
 }
